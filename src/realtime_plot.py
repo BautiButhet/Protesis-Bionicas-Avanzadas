@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-# realtime_plot_clean.py
 """
-Monitor de micro-desplazamiento (limpio).
+Monitor de micro-desplazamiento.
 - MODOS: 'simulate' | 'serial'
 - CSV: main.csv
 - SQLite: main.db
