@@ -9,7 +9,7 @@
 ICM42688_FIFO imu(Wire, 0x69);//, 8000000); // SPI, CS pin, velocidad alta (8 MHz)
 
 float ax[MAX_SAMPLES], ay[MAX_SAMPLES], az[MAX_SAMPLES];
-float gx[MAX_SAMPLES], gy[MAX_SAMPLES], gz[MAX_SAMPLES];
+//float gx[MAX_SAMPLES], gy[MAX_SAMPLES], gz[MAX_SAMPLES];
 
 const float SENSOR_ODR_HZ = 12.5f; //1000.0;  // Tasa de muestreo esperada (en Hz) const float SENSOR_ODR_HZ = 12.5f;  // <-- Debe coincidir con la ODR configurada en el sensor
 uint32_t lastReadMs = 0;
@@ -36,15 +36,15 @@ void setup() {
     Serial.println("ERROR iniciando la sensibilidad del acelerometro ICM-42688");
     while (1) { delay(1000); }
   }    
-  if(imu.setGyroFS(ICM42688::dps250) < 0)  
-  {
-    Serial.println("ERROR iniciando la sensibilidad del giroscopio ICM-42688");
-    while (1) { delay(1000); }
-  }  
+  // if(imu.setGyroFS(ICM42688::dps250) < 0)  
+  // {
+  //   Serial.println("ERROR iniciando la sensibilidad del giroscopio ICM-42688");
+  //   while (1) { delay(1000); }
+  // }  
 
   // set output data rate to 12.5 Hz
 	imu.setAccelODR(ICM42688::odr12_5);
-	imu.setGyroODR(ICM42688::odr12_5);
+	// imu.setGyroODR(ICM42688::odr12_5);
 
   // Configurar FIFO (acelerómetro + giroscopio)
   if(imu.enableFifo(true, true, false) < 0)
@@ -100,19 +100,19 @@ void loop() {
     imu.getFifoAccelY_mss(&nAccel, ay);
     imu.getFifoAccelZ_mss(&nAccel, az);
 
-    size_t nGyro = 0;
-    imu.getFifoGyroX(&nGyro, gx);
-    imu.getFifoGyroY(&nGyro, gy);
-    imu.getFifoGyroZ(&nGyro, gz);
+    // size_t nGyro = 0;
+    // imu.getFifoGyroX(&nGyro, gx);
+    // imu.getFifoGyroY(&nGyro, gy);
+    // imu.getFifoGyroZ(&nGyro, gz);
 
-    size_t nValido = min(nAccel, nGyro); // número de muestras coherente
+    // size_t nValido = min(nAccel, nGyro); // número de muestras coherente
 
     unsigned long t_read = micros();
     double dt_us = 1000000.0 / SENSOR_ODR_HZ; // debe coincidir con ODR
 
-    for (size_t i = 0; i < nValido; ++i) {
-      unsigned long ts = (unsigned long)(t_read - (unsigned long)((nValido - 1 - i) * dt_us));
-      Serial.printf("%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", ts, ax[i], ay[i], az[i], gx[i], gy[i], gz[i]);
+    for (size_t i = 0; i < nAccel; ++i) {
+      unsigned long ts = (unsigned long)(t_read - (unsigned long)((nAccel - 1 - i) * dt_us));
+      Serial.printf("%lu,%.6f,%.6f,%.6f\n", ts, ax[i], ay[i], az[i]);//, gx[i], gy[i], gz[i]);
     }
     // si había más muestras en el FIFO que MAX_SAMPLES, la próxima iteración las leerá
   }
