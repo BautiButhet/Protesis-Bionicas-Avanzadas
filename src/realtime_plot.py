@@ -1,453 +1,570 @@
-"""
-Monitor de micro-desplazamiento.
-- MODOS: 'simulate' | 'serial'
-- CSV: main.csv
-- SQLite: main.db
-- events.csv: registro de eventos
-"""
+# """
+# Monitor de micro-desplazamiento.
+# - MODOS: 'simulate' | 'serial'
+# - CSV: main.csv
+# - SQLite: main.db
+# - events.csv: registro de eventos
 
-import os, csv, time, math, threading, queue, random, sqlite3
-from collections import deque
-from datetime import datetime
-try:
-    import serial
-except Exception:
-    serial = None
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+# Resumen práctico:
 
-# -------- CONFIG -----------
-MODE = 'simulate'         # 'simulate' | 'serial'
-SERIAL_PORT = 'COM3'
-BAUD_RATE = 115200
+# Simulate → 20 Hz (un punto cada 50 ms).
 
-SESSION_FOLDER = '.'
-MASTER_CSV = os.path.join(SESSION_FOLDER, 'main.csv')
-SQLITE_DB = os.path.join(SESSION_FOLDER, 'main.db')
-EVENTS_CSV = os.path.join(SESSION_FOLDER, 'events.csv')
+# Serial → ≈12.5 Hz (si el sensor ODR = 12.5 Hz), aunque puede variar según cómo el MCU agrupe/imprima el FIFO.
 
-HISTORY_SECONDS = 30.0
-MAX_POINTS = 2000
-WRITE_FLUSH_INTERVAL = 1.0
+# Escritura a disco → cada fila se escribe cuando el writer la procesa; flush físico cada WRITE_FLUSH_INTERVAL (=1s).
 
-# físico
-SENSOR_RADIUS_MM = 30.0
-ACC_WINDOW_SECONDS = 1.0
+# Commit SQLite → cada DB_COMMIT_BATCH (=50) filas.
 
-# umbrales (µm)
-THRESH_OK_UM = 50
-THRESH_WARNING_UM = 100.0
-THRESH_ALERT_UM = 150.0
-SUSTAIN_SECONDS_MIN = 2.5
-SUSTAIN_SECONDS_MAX = 10
+# Plot → refresco cada 200 ms (5 Hz).
+# """
 
-# simulación
-SIM_MIN_UM = 5.0
-SIM_PHASE1_MAX_UM = 100.0
-SIM_PHASE2_MAX_UM = 200.0
-SIM_MEAN_UM = 40.0
-SIM_PRODUCE_INTERVAL = 0.05
-SIM_PHASE1_SECONDS = 15.0
-SIM_OU_THETA = 0.6
-SIM_OU_SIGMA = 0.8
-SIM_MAX_STEP_UM = 5.0
-SIM_MAX_OMEGA_DEG = 400.0
+# import os, csv, time, math, threading, queue, random, sqlite3
+# from collections import deque
+# from datetime import datetime
+# try:
+#     import serial
+# except Exception:
+#     serial = None
+# import matplotlib.pyplot as plt
+# import matplotlib.animation as animation
 
-# Cabecera CSV (coherente con DB)
-HEADER = ['ts_s','ax','ay','az','acc_mag','disp_um_acc','disp_um_combined']
+# # -------- CONFIG -----------
+# MODE = 'serial'         # 'simulate' | 'serial'
+# SERIAL_PORT = 'COM3'
+# BAUD_RATE = 115200
 
-# Estructuras
-row_queue = queue.Queue(maxsize=20000)
-plot_lock = threading.Lock()
-times = deque(maxlen=MAX_POINTS)
-acc_mag = deque(maxlen=MAX_POINTS)
-disp_um_buf = deque(maxlen=MAX_POINTS)
+# SESSION_FOLDER = '.'
+# MASTER_CSV = os.path.join(SESSION_FOLDER, 'main.csv')
+# SQLITE_DB = os.path.join(SESSION_FOLDER, 'main.db')
+# EVENTS_CSV = os.path.join(SESSION_FOLDER, 'events.csv')
 
-stop_event = threading.Event()
-csv_file = None; csv_writer = None
+# HISTORY_SECONDS = 30.0
+# MAX_POINTS = 2000
+# WRITE_FLUSH_INTERVAL = 1.0
 
-acc_window = deque()
-last_ts_for_gyro = None  # no usado actualmente
+# # físico
+# SENSOR_RADIUS_MM = 30.0
+# ACC_WINDOW_SECONDS = 1.0
 
-# estado alarmas
-current_state = "OK"
-warning_since = None
-start_time = time.time()
+# # umbrales (µm)
+# THRESH_OK_UM = 50
+# THRESH_WARNING_UM = 100.0
+# THRESH_ALERT_UM = 150.0
+# SUSTAIN_SECONDS_MIN = 2.5
+# SUSTAIN_SECONDS_MAX = 10
 
-# ---------- DB ----------
-def init_db(path):
-    conn = sqlite3.connect(path, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS measurements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_s REAL,
-            ax REAL, ay REAL, az REAL,
-            acc_mag REAL,
-            disp_um_acc REAL,
-            disp_um_combined REAL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_s REAL,
-            disp_um REAL,
-            level TEXT,
-            message TEXT
-        )
-    """)
-    conn.commit()
-    return conn
+# # simulación
+# SIM_MIN_UM = 5.0
+# SIM_PHASE1_MAX_UM = 100.0
+# SIM_PHASE2_MAX_UM = 200.0
+# SIM_MEAN_UM = 40.0
+# SIM_PRODUCE_INTERVAL = 0.05
+# SIM_PHASE1_SECONDS = 15.0
+# SIM_OU_THETA = 0.6
+# SIM_OU_SIGMA = 0.8
+# SIM_MAX_STEP_UM = 5.0
+# SIM_MAX_OMEGA_DEG = 400.0
 
-# ---------- PRODUCER SIMULATE ----------
-def producer_simulate(produce_interval=SIM_PRODUCE_INTERVAL):
-    """
-    Encola filas tipo:
-      - simulate: [ts_s, ax, ay, az, acc_mag, sim_disp_um]  (len==6)
-    """
-    print(f"Producer: SIMULATE (phase1 {SIM_PHASE1_SECONDS}s, phase1_max {SIM_PHASE1_MAX_UM}µm)")
-    prev_disp_um = max(SIM_MIN_UM, min(SIM_MEAN_UM, SIM_PHASE1_MAX_UM))
-    x = prev_disp_um
-    t_start = time.time()
+# # Cabecera CSV (coherente con DB)
+# HEADER = ['ts_s','ax','ay','az','acc_mag','disp_um_acc','disp_um_combined']
 
-    while not stop_event.is_set():
-        ts = time.time()
-        dt = produce_interval
+# # Estructuras
+# row_queue = queue.Queue(maxsize=20000)
+# plot_lock = threading.Lock()
+# times = deque(maxlen=MAX_POINTS)
+# acc_mag = deque(maxlen=MAX_POINTS)
+# disp_um_buf = deque(maxlen=MAX_POINTS)
 
-        elapsed = ts - t_start
-        if elapsed < SIM_PHASE1_SECONDS:
-            current_min = SIM_MIN_UM
-            current_max = SIM_PHASE1_MAX_UM
-            dyn_step_cap = (current_max - current_min) * dt / (SIM_PHASE1_SECONDS)
-        else:
-            current_min = SIM_MIN_UM
-            current_max = SIM_PHASE2_MAX_UM
-            dyn_step_cap = max((current_max - current_min) * dt / (SIM_PHASE1_SECONDS*2), SIM_MAX_STEP_UM)
+# stop_event = threading.Event()
+# csv_file = None; csv_writer = None
 
-        mu = SIM_MEAN_UM + (elapsed / 5.0) * 20.0
-        theta = SIM_OU_THETA
-        sigma = SIM_OU_SIGMA
-        noise = random.gauss(0.0, 1.0)
-        x = x + theta * (mu - x) * dt + sigma * math.sqrt(max(dt, 1e-9)) * noise
+# acc_window = deque()
+# last_ts_for_gyro = None  # no usado actualmente
 
-        x = max(current_min, min(current_max, x))
+# # estado alarmas
+# current_state = "OK"
+# warning_since = None
+# start_time = time.time()
 
-        step_cap = min(SIM_MAX_STEP_UM, max(dyn_step_cap, 1e-6))
-        delta_um = x - prev_disp_um
-        if delta_um > step_cap:
-            delta_um = step_cap; x = prev_disp_um + delta_um
-        elif delta_um < -step_cap:
-            delta_um = -step_cap; x = prev_disp_um + delta_um
+# # ---------- DB ----------
+# def init_db(path):
+#     conn = sqlite3.connect(path, check_same_thread=False)
+#     c = conn.cursor()
+#     c.execute("""
+#         CREATE TABLE IF NOT EXISTS measurements (
+#             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#             ts_s REAL,
+#             ax REAL, ay REAL, az REAL,
+#             acc_mag REAL,
+#             disp_um_acc REAL,
+#             disp_um_combined REAL
+#         )
+#     """)
+#     c.execute("""
+#         CREATE TABLE IF NOT EXISTS events (
+#             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#             ts_s REAL,
+#             disp_um REAL,
+#             level TEXT,
+#             message TEXT
+#         )
+#     """)
+#     conn.commit()
+#     return conn
 
-        # acelerómetro simplificado: g + ruido pequeño
-        ax = random.normalvariate(0.0, 0.02)
-        ay = random.normalvariate(0.0, 0.02)
-        az = 9.81 + random.normalvariate(0.0, 0.02)
-        acc = math.sqrt(ax*ax + ay*ay + az*az)
+# # ---------- PRODUCER SIMULATE ----------
+# def producer_simulate(produce_interval=SIM_PRODUCE_INTERVAL):
+#     """
+#     Encola filas tipo:
+#       - simulate: [ts_s, ax, ay, az, acc_mag, sim_disp_um]  (len==6)
+#     """
+#     print(f"Producer: SIMULATE (phase1 {SIM_PHASE1_SECONDS}s, phase1_max {SIM_PHASE1_MAX_UM}µm)")
+#     prev_disp_um = max(SIM_MIN_UM, min(SIM_MEAN_UM, SIM_PHASE1_MAX_UM))
+#     x = prev_disp_um
+#     t_start = time.time()
 
-        row = [ts, ax, ay, az, acc, x]
-        try:
-            row_queue.put(row, timeout=0.5)
-        except queue.Full:
-            pass
+#     while not stop_event.is_set():
+#         ts = time.time()
+#         dt = produce_interval
 
-        prev_disp_um = x
-        time.sleep(produce_interval)
+#         elapsed = ts - t_start
+#         if elapsed < SIM_PHASE1_SECONDS:
+#             current_min = SIM_MIN_UM
+#             current_max = SIM_PHASE1_MAX_UM
+#             dyn_step_cap = (current_max - current_min) * dt / (SIM_PHASE1_SECONDS)
+#         else:
+#             current_min = SIM_MIN_UM
+#             current_max = SIM_PHASE2_MAX_UM
+#             dyn_step_cap = max((current_max - current_min) * dt / (SIM_PHASE1_SECONDS*2), SIM_MAX_STEP_UM)
 
-# ---------- PRODUCER SERIAL ----------
-def producer_serial(port=SERIAL_PORT, baud=BAUD_RATE):
-    if serial is None:
-        print("pyserial no instalado; modo 'serial' no disponible.")
-        return
-    print(f"Producer: SERIAL {port}@{baud}")
-    try:
-        ser = serial.Serial(port, baud, timeout=1.0)
-        time.sleep(0.05)
-    except Exception as e:
-        print("Error abriendo serial:", e)
-        return
-    while not stop_event.is_set():
-        try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if not line: continue
-            parts = line.split(',')
-            # Arduino imprime: ts_us,ax,ay,az
-            if len(parts) < 4:
-                continue
-            try:
-                ts_us = float(parts[0])
-                ts_s = ts_us / 1e6
-                ax = float(parts[1]); ay = float(parts[2]); az = float(parts[3])
-            except Exception:
-                continue
-            acc = math.sqrt(ax*ax + ay*ay + az*az)
-            row = [ts_s, ax, ay, az, acc]   # len==5
-            try: row_queue.put(row, timeout=0.5)
-            except queue.Full: pass
-        except Exception as e:
-            print("Error serial:", e); time.sleep(0.05)
-    try: ser.close()
-    except: pass
+#         mu = SIM_MEAN_UM + (elapsed / 5.0) * 20.0
+#         theta = SIM_OU_THETA
+#         sigma = SIM_OU_SIGMA
+#         noise = random.gauss(0.0, 1.0)
+#         x = x + theta * (mu - x) * dt + sigma * math.sqrt(max(dt, 1e-9)) * noise
 
-# ---------- CÁLCULOS ----------
-def compute_disp_from_acc_window(row):
-    """
-    row: [ts_s, ax, ay, az]
-    Integra ventana (ACC_WINDOW_SECONDS) p/ estimar pico-a-pico de desplazamiento (m) -> devuelve p2p (mm)
-    Método: quitar media de aceleración, integrar trapezoidal para velocidad, quitar mean, integrar para posición, devolver p2p.
-    """
-    ts, ax, ay, az = row[0], row[1], row[2], row[3]
-    acc_window.append((ts, ax, ay, az))
-    while acc_window and (ts - acc_window[0][0] > ACC_WINDOW_SECONDS):
-        acc_window.popleft()
-    if len(acc_window) < 3:
-        return 0.0
-    xs = [item[0] for item in acc_window]
-    axs = [item[1] for item in acc_window]
-    ays = [item[2] for item in acc_window]
-    azs = [item[3] for item in acc_window]
-    mags = [math.sqrt(axs[i]*axs[i] + ays[i]*ays[i] + azs[i]*azs[i]) for i in range(len(axs))]
-    mean_a = sum(mags)/len(mags)
-    mags = [m - mean_a for m in mags]  # high-pass remove gravity bias (aprox)
-    # integrar -> velocidad
-    vs = [0.0]*len(mags)
-    for i in range(1, len(mags)):
-        dt = xs[i] - xs[i-1]
-        if dt <= 0: dt = 1e-6
-        vs[i] = vs[i-1] + 0.5*(mags[i] + mags[i-1]) * dt
-    # remove mean velocity (evita drift constante)
-    mean_v = sum(vs)/len(vs)
-    vs = [v - mean_v for v in vs]
-    # integrar -> posicion
-    ss = [0.0]*len(vs)
-    for i in range(1, len(vs)):
-        dt = xs[i] - xs[i-1]
-        if dt <= 0: dt = 1e-6
-        ss[i] = ss[i-1] + 0.5*(vs[i] + vs[i-1]) * dt
-    # p2p en metros -> convertir mm
-    p2p_m = max(ss) - min(ss)
-    p2p_mm = abs(p2p_m * 1000.0)
-    return p2p_mm
+#         x = max(current_min, min(current_max, x))
 
-# ---------- CSV / WRITER ----------
-def ensure_csv_header(path):
-    exists = os.path.exists(path)
-    f = open(path, 'a', newline='')
-    w = csv.writer(f)
-    if not exists:
-        w.writerow(HEADER); f.flush()
-    return f, w
+#         step_cap = min(SIM_MAX_STEP_UM, max(dyn_step_cap, 1e-6))
+#         delta_um = x - prev_disp_um
+#         if delta_um > step_cap:
+#             delta_um = step_cap; x = prev_disp_um + delta_um
+#         elif delta_um < -step_cap:
+#             delta_um = -step_cap; x = prev_disp_um + delta_um
 
-def writer_thread_func(db_conn):
-    global csv_file, csv_writer
-    csv_file, csv_writer = ensure_csv_header(MASTER_CSV)
-    c = db_conn.cursor()
-    last_flush = time.time()
-    db_batch_count = 0
-    DB_COMMIT_BATCH = 50
+#         # acelerómetro simplificado: g + ruido pequeño
+#         ax = random.normalvariate(0.0, 0.02)
+#         ay = random.normalvariate(0.0, 0.02)
+#         az = 9.81 + random.normalvariate(0.0, 0.02)
+#         acc = math.sqrt(ax*ax + ay*ay + az*az)
 
-    # events header
-    if not os.path.exists(EVENTS_CSV):
-        with open(EVENTS_CSV, 'w', newline='') as fe:
-            csv.writer(fe).writerow(['ts_s','disp_um','level','message'])
+#         row = [ts, ax, ay, az, acc, x]
+#         try:
+#             row_queue.put(row, timeout=0.5)
+#         except queue.Full:
+#             pass
 
-    # estadística de validación (modo simulate)
-    sim_count = 0
-    sim_error_sq = 0.0
+#         prev_disp_um = x
+#         time.sleep(produce_interval)
 
-    while not stop_event.is_set():
-        try:
-            row = row_queue.get(timeout=1.0)
-        except queue.Empty:
-            if time.time() - last_flush > WRITE_FLUSH_INTERVAL:
-                try: csv_file.flush()
-                except: pass
-                last_flush = time.time()
-            continue
+# # ---------- PRODUCER SERIAL ----------
+# def producer_serial(port=SERIAL_PORT, baud=BAUD_RATE):
+#     if serial is None:
+#         print("pyserial no instalado; modo 'serial' no disponible.")
+#         return
+#     print(f"Producer: SERIAL {port}@{baud}")
+#     try:
+#         ser = serial.Serial(port, baud, timeout=1.0)
+#         time.sleep(0.05)
+#     except Exception as e:
+#         print("Error abriendo serial:", e)
+#         return
+#     while not stop_event.is_set():
+#         try:
+#             line = ser.readline().decode('utf-8', errors='ignore').strip()
+#             if not line: continue
+#             parts = line.split(',')
+#             # Arduino imprime: ts_us,ax,ay,az
+#             if len(parts) < 4:
+#                 continue
+#             try:
+#                 ts_us = float(parts[0])
+#                 ts_s = ts_us / 1e6
+#                 ax = float(parts[1]); ay = float(parts[2]); az = float(parts[3])
+#             except Exception as e:
+#                 continue
+#             acc = math.sqrt(ax*ax + ay*ay + az*az)
+#             row = [ts_s, ax, ay, az, acc]   # len==5
+#             try: row_queue.put(row, timeout=0.5)
+#             except queue.Full: pass
+#         except Exception as e:
+#             print("Error serial:", e); time.sleep(0.05)
+#     try: ser.close()
+#     except: pass
 
-        # distinguir tipos de fila por longitud:
-        # simulate -> len==6: [ts,ax,ay,az,acc, sim_disp_um]
-        # serial   -> len==5: [ts,ax,ay,az,acc]
-        try:
-            if len(row) == 6:
-                ts = float(row[0]); ax_v = float(row[1]); ay_v = float(row[2]); az_v = float(row[3])
-                acc_mag_v = float(row[4]); sim_disp_um = float(row[5])
-                s_mm_acc = compute_disp_from_acc_window([ts, ax_v, ay_v, az_v])
-                s_um_acc = s_mm_acc * 1000.0
-                disp_um_combined = sim_disp_um  # ground truth in simulate mode
-                # Validación: comparar estimado por acelerómetro con sim_disp
-                err = s_um_acc - sim_disp_um
-                sim_count += 1
-                sim_error_sq += err*err
-                if sim_count % 50 == 0:
-                    rms = math.sqrt(sim_error_sq / sim_count) if sim_count > 0 else 0.0
-                    print(f"[SIM VAL] muestras={sim_count} err_inst={err:.1f}µm RMS={rms:.2f}µm")
-                full_row = [ts, ax_v, ay_v, az_v, acc_mag_v, s_um_acc, disp_um_combined]
+# # ---------- CÁLCULOS ----------
+# def compute_disp_from_acc_window(row):
+#     """
+#     row: [ts_s, ax, ay, az]
+#     Integra ventana (ACC_WINDOW_SECONDS) p/ estimar pico-a-pico de desplazamiento (m) -> devuelve p2p (mm)
+#     Método: quitar media de aceleración, integrar trapezoidal para velocidad, quitar mean, integrar para posición, devolver p2p.
+#     """
+#     ts, ax, ay, az = row[0], row[1], row[2], row[3]
+#     acc_window.append((ts, ax, ay, az))
+#     while acc_window and (ts - acc_window[0][0] > ACC_WINDOW_SECONDS):
+#         acc_window.popleft()
+#     if len(acc_window) < 3:
+#         return 0.0
+#     xs = [item[0] for item in acc_window]
+#     axs = [item[1] for item in acc_window]
+#     ays = [item[2] for item in acc_window]
+#     azs = [item[3] for item in acc_window]
+#     mags = [math.sqrt(axs[i]*axs[i] + ays[i]*ays[i] + azs[i]*azs[i]) for i in range(len(axs))]
+#     mean_a = sum(mags)/len(mags)
+#     mags = [m - mean_a for m in mags]  # high-pass remove gravity bias (aprox)
+#     # integrar -> velocidad
+#     vs = [0.0]*len(mags)
+#     for i in range(1, len(mags)):
+#         dt = xs[i] - xs[i-1]
+#         if dt <= 0: dt = 1e-6
+#         vs[i] = vs[i-1] + 0.5*(mags[i] + mags[i-1]) * dt
+#     # remove mean velocity (evita drift constante)
+#     mean_v = sum(vs)/len(vs)
+#     vs = [v - mean_v for v in vs]
+#     # integrar -> posicion
+#     ss = [0.0]*len(vs)
+#     for i in range(1, len(vs)):
+#         dt = xs[i] - xs[i-1]
+#         if dt <= 0: dt = 1e-6
+#         ss[i] = ss[i-1] + 0.5*(vs[i] + vs[i-1]) * dt
+#     # p2p en metros -> convertir mm
+#     p2p_m = max(ss) - min(ss)
+#     p2p_mm = abs(p2p_m * 1000.0)
+#     return p2p_mm
 
-            elif len(row) == 5:
-                ts = float(row[0]); ax_v = float(row[1]); ay_v = float(row[2]); az_v = float(row[3])
-                acc_mag_v = float(row[4])
-                s_mm_acc = compute_disp_from_acc_window([ts, ax_v, ay_v, az_v])
-                s_um_acc = s_mm_acc * 1000.0
-                disp_um_combined = s_um_acc
-                full_row = [ts, ax_v, ay_v, az_v, acc_mag_v, s_um_acc, disp_um_combined]
-            else:
-                # fila inesperada: descartar
-                print("Fila con formato inesperado, longitud=", len(row))
-                continue
-        except Exception as e:
-            print("Error procesando fila:", e)
-            continue
+# # ---------- CSV / WRITER ----------
+# def ensure_csv_header(path):
+#     exists = os.path.exists(path)
+#     f = open(path, 'a', newline='')
+#     w = csv.writer(f)
+#     if not exists:
+#         w.writerow(HEADER); f.flush()
+#     return f, w
 
-        # escribir CSV
-        try:
-            csv_writer.writerow(full_row)
-        except Exception as e:
-            print("Error escribiendo CSV:", e)
+# def writer_thread_func(db_conn):
+#     global csv_file, csv_writer
+#     csv_file, csv_writer = ensure_csv_header(MASTER_CSV)
+#     # c = db_conn.cursor()
+#     last_flush = time.time()
+#     db_batch_count = 0
+#     DB_COMMIT_BATCH = 50
 
-        # insertar DB (coincidir con schema)
-        try:
-            c.execute("""INSERT INTO measurements (ts_s,ax,ay,az,acc_mag,disp_um_acc,disp_um_combined)
-                         VALUES (?,?,?,?,?,?,?)""", tuple(full_row))
-            db_batch_count += 1
-            if db_batch_count >= DB_COMMIT_BATCH:
-                db_conn.commit(); db_batch_count = 0
-        except Exception as e:
-            print("Error insert DB measurements:", e)
+#     # events header
+#     if not os.path.exists(EVENTS_CSV):
+#         with open(EVENTS_CSV, 'w', newline='') as fe:
+#             csv.writer(fe).writerow(['ts_s','disp_um','level','message'])
 
-        # actualizar buffers para plot
-        with plot_lock:
-            times.append(full_row[0])
-            acc_mag.append(full_row[4])
-            disp_um_buf.append(full_row[6])
+#     # estadística de validación (modo simulate)
+#     sim_count = 0
+#     sim_error_sq = 0.0
 
-        # alarmas y log de eventos (usa disp_um_combined)
-        alert_and_log(full_row[6], full_row[0], c)
+#     while not stop_event.is_set():
+#         try:
+#             row = row_queue.get(timeout=1.0)
+#         except queue.Empty:
+#             if time.time() - last_flush > WRITE_FLUSH_INTERVAL:
+#                 try: csv_file.flush()
+#                 except: pass
+#                 last_flush = time.time()
+#             continue
 
-        # flush periódico
-        if time.time() - last_flush > WRITE_FLUSH_INTERVAL:
-            try: csv_file.flush()
-            except: pass
-            last_flush = time.time()
+#         # distinguir tipos de fila por longitud:
+#         # simulate -> len==6: [ts,ax,ay,az,acc, sim_disp_um]
+#         # serial   -> len==5: [ts,ax,ay,az,acc]
+#         try:
+#             if len(row) == 6:
+#                 ts = float(row[0]); ax_v = float(row[1]); ay_v = float(row[2]); az_v = float(row[3])
+#                 acc_mag_v = float(row[4]); sim_disp_um = float(row[5])
+#                 s_mm_acc = compute_disp_from_acc_window([ts, ax_v, ay_v, az_v])
+#                 s_um_acc = s_mm_acc * 1000.0
+#                 disp_um_combined = sim_disp_um  # ground truth in simulate mode
+#                 # Validación: comparar estimado por acelerómetro con sim_disp
+#                 err = s_um_acc - sim_disp_um
+#                 sim_count += 1
+#                 sim_error_sq += err*err
+#                 if sim_count % 50 == 0:
+#                     rms = math.sqrt(sim_error_sq / sim_count) if sim_count > 0 else 0.0
+#                     print(f"[SIM VAL] muestras={sim_count} err_inst={err:.1f}µm RMS={rms:.2f}µm")
+#                 full_row = [ts, ax_v, ay_v, az_v, acc_mag_v, s_um_acc, disp_um_combined]
 
-    # al cerrar
-    try:
-        if db_batch_count > 0: db_conn.commit()
-    except: pass
-    try:
-        if csv_file: csv_file.flush(); csv_file.close()
-    except: pass
+#             elif len(row) == 5:
+#                 ts = float(row[0]); ax_v = float(row[1]); ay_v = float(row[2]); az_v = float(row[3])
+#                 acc_mag_v = float(row[4])
+#                 s_mm_acc = compute_disp_from_acc_window([ts, ax_v, ay_v, az_v])
+#                 s_um_acc = s_mm_acc * 1000.0
+#                 disp_um_combined = s_um_acc
+#                 full_row = [ts, ax_v, ay_v, az_v, acc_mag_v, s_um_acc, disp_um_combined]
+#             else:
+#                 # fila inesperada: descartar
+#                 print("Fila con formato inesperado, longitud=", len(row))
+#                 continue
+#         except Exception as e:
+#             print("Error procesando fila:", e)
+#             continue
 
-# ---------- LOG/ALARMAS ----------
-def log_event_to_files(ts_s, disp_um, level, message, cursor=None):
-    try:
-        if cursor is not None:
-            cursor.execute("INSERT INTO events (ts_s, disp_um, level, message) VALUES (?,?,?,?)",
-                           (ts_s, disp_um, level, message))
-    except Exception as e:
-        print("Error insert events DB:", e)
-    try:
-        with open(EVENTS_CSV, 'a', newline='') as fe:
-            csv.writer(fe).writerow([ts_s, disp_um, level, message])
-    except Exception as e:
-        print("Error escribiendo events.csv:", e)
+#         # escribir CSV
+#         try:
+#             csv_writer.writerow(full_row)
+#         except Exception as e:
+#             print("Error escribiendo CSV:", e)
 
-def alert_and_log(disp_um, ts_now, db_cursor):
-    global current_state, warning_since
-    if disp_um > THRESH_ALERT_UM:
-        if current_state != "ALERT":
-            current_state = "ALERT"
-            msg = f"ALERTA INMEDIATA: Desplazamiento {disp_um:.1f} µm > {THRESH_ALERT_UM} µm"
-            print(f"[{datetime.fromtimestamp(ts_now)}] {msg}")
-            log_event_to_files(ts_now, disp_um, "ALERT", msg, db_cursor)
-        return
-    if disp_um > THRESH_OK_UM:
-        if warning_since is None:
-            warning_since = ts_now
-        elapsed = ts_now - warning_since
-        if elapsed >= SUSTAIN_SECONDS_MIN:
-            if current_state != "WARNING":
-                current_state = "WARNING"
-                msg = f"ADVERTENCIA: Desplazamiento {disp_um:.1f} µm sostenido por {elapsed:.2f}s"
-                print(f"[{datetime.fromtimestamp(ts_now)}] {msg}")
-                log_event_to_files(ts_now, disp_um, "WARNING", msg, db_cursor)
-        return
-    if disp_um <= THRESH_OK_UM:
-        if current_state != "OK":
-            elapsed = ts_now - (warning_since or ts_now)
-            msg = f"VOLVIO A OK: Desplazamiento {disp_um:.1f} µm luego de {elapsed:.2f}s"
-            print(f"[{datetime.fromtimestamp(ts_now)}] {msg}")
-            log_event_to_files(ts_now, disp_um, "OK", msg, db_cursor)
-        current_state = "OK"
-        warning_since = None
+#         # # insertar DB (coincidir con schema)
+#         # try:
+#         #     c.execute("""INSERT INTO measurements (ts_s,ax,ay,az,acc_mag,disp_um_acc,disp_um_combined)
+#         #                  VALUES (?,?,?,?,?,?,?)""", tuple(full_row))
+#         #     db_batch_count += 1
+#         #     if db_batch_count >= DB_COMMIT_BATCH:
+#         #         db_conn.commit(); db_batch_count = 0
+#         except Exception as e:
+#             print("Error insert DB measurements:", e)
 
-# ---------- PLOT ----------
-fig, (ax1, ax_disp) = plt.subplots(2, 1, figsize=(10, 8))
-line_acc, = ax1.plot([], [], label='Aceleración (m/s²)'); ax1.grid(True); ax1.legend()
-line_disp, = ax_disp.plot([], [], label='Microdesplazamiento (µm)'); ax_disp.grid(True); ax_disp.legend()
-ax_disp.axhline(THRESH_OK_UM, linestyle='--', linewidth=1, label='OK threshold')
-ax_disp.axhline(THRESH_ALERT_UM, linestyle='--', linewidth=1, label='ALERT threshold')
-status_text = ax_disp.text(0.02, 0.95, '', transform=ax_disp.transAxes, fontsize=10, verticalalignment='top',
-                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+#         # actualizar buffers para plot
+#         with plot_lock:
+#             times.append(full_row[0])
+#             acc_mag.append(full_row[4])
+#             disp_um_buf.append(full_row[6])
 
-def safe_limits(data, pad=0.05):
-    if not data: return -1.0, 1.0
-    mn = min(data); mx = max(data)
-    if math.isclose(mn, mx): mn -= 0.5; mx += 0.5
-    rng = mx - mn
-    return mn - pad*rng, mx + pad*rng
+#         # alarmas y log de eventos (usa disp_um_combined)
+#         alert_and_log(full_row[6], full_row[0], c)
 
-def update_plot(frame):
-    with plot_lock:
-        if not times:
-            return line_acc, line_disp, status_text
-        xs = list(times); accs = list(acc_mag); ds = list(disp_um_buf)
-    t0 = xs[0]; x_rel = [xx - t0 for xx in xs]; tmax = x_rel[-1]
-    line_acc.set_data(x_rel, accs); line_disp.set_data(x_rel, ds)
-    xmin = max(0.0, tmax - HISTORY_SECONDS)
-    ax1.set_xlim(xmin, tmax + 0.05); ax_disp.set_xlim(xmin, tmax + 0.05)
-    aymin, aymax = safe_limits(accs); dmin, dmax = safe_limits(ds)
-    ax1.set_ylim(aymin, aymax)
-    ax_disp.set_ylim(min(dmin, -10), max(dmax*1.1, THRESH_ALERT_UM*1.2))
-    status_text.set_text(f"Estado: {current_state}\nÚltimo disp: {ds[-1]:.1f} µm\nR(mm)={SENSOR_RADIUS_MM}")
-    if current_state == "OK": ax_disp.set_facecolor((0.95,1.0,0.95))
-    elif current_state == "WARNING": ax_disp.set_facecolor((1.0,1.0,0.8))
-    else: ax_disp.set_facecolor((1.0,0.9,0.9))
-    return line_acc, line_disp, status_text
+#         # flush periódico
+#         if time.time() - last_flush > WRITE_FLUSH_INTERVAL:
+#             try: csv_file.flush()
+#             except: pass
+#             last_flush = time.time()
 
-# ---------- MAIN ----------
-def start_producer():
-    if MODE == 'simulate':
-        t = threading.Thread(target=producer_simulate, daemon=True)
-    elif MODE == 'serial':
-        t = threading.Thread(target=producer_serial, daemon=True)
-    else:
-        raise ValueError("MODE inválido")
-    t.start(); return t
+#     # al cerrar
+#     try:
+#         if db_batch_count > 0: db_conn.commit()
+#     except: pass
+#     try:
+#         if csv_file: csv_file.flush(); csv_file.close()
+#     except: pass
 
-def main():
-    print("Iniciando monitor — MODE =", MODE)
-    if MODE == 'serial' and serial is None:
-        print("pyserial no instalado. Instala pyserial para usar serial.")
-        return
+# # ---------- LOG/ALARMAS ----------
+# def log_event_to_files(ts_s, disp_um, level, message, cursor=None):
+#     try:
+#         if cursor is not None:
+#             cursor.execute("INSERT INTO events (ts_s, disp_um, level, message) VALUES (?,?,?,?)",
+#                            (ts_s, disp_um, level, message))
+#     except Exception as e:
+#         print("Error insert events DB:", e)
+#     try:
+#         with open(EVENTS_CSV, 'a', newline='') as fe:
+#             csv.writer(fe).writerow([ts_s, disp_um, level, message])
+#     except Exception as e:
+#         print("Error escribiendo events.csv:", e)
 
-    db_conn = init_db(SQLITE_DB)
-    writer = threading.Thread(target=writer_thread_func, args=(db_conn,), daemon=True)
-    writer.start()
-    prod = start_producer()
-    ani = animation.FuncAnimation(fig, update_plot, interval=200, cache_frame_data=False)
-    plt.tight_layout()
-    try:
-        plt.show()
-    except KeyboardInterrupt:
-        print("Interrumpido por teclado.")
-    finally:
-        stop_event.set()
-        time.sleep(0.5)
-        try: db_conn.commit(); db_conn.close()
-        except: pass
-        print("Cerrado.")
+# def alert_and_log(disp_um, ts_now, db_cursor):
+#     global current_state, warning_since
+#     if disp_um > THRESH_ALERT_UM:
+#         if current_state != "ALERT":
+#             current_state = "ALERT"
+#             msg = f"ALERTA INMEDIATA: Desplazamiento {disp_um:.1f} µm > {THRESH_ALERT_UM} µm"
+#             print(f"[{datetime.fromtimestamp(ts_now)}] {msg}")
+#             log_event_to_files(ts_now, disp_um, "ALERT", msg, db_cursor)
+#         return
+#     if disp_um > THRESH_OK_UM:
+#         if warning_since is None:
+#             warning_since = ts_now
+#         elapsed = ts_now - warning_since
+#         if elapsed >= SUSTAIN_SECONDS_MIN:
+#             if current_state != "WARNING":
+#                 current_state = "WARNING"
+#                 msg = f"ADVERTENCIA: Desplazamiento {disp_um:.1f} µm sostenido por {elapsed:.2f}s"
+#                 print(f"[{datetime.fromtimestamp(ts_now)}] {msg}")
+#                 log_event_to_files(ts_now, disp_um, "WARNING", msg, db_cursor)
+#         return
+#     if disp_um <= THRESH_OK_UM:
+#         if current_state != "OK":
+#             elapsed = ts_now - (warning_since or ts_now)
+#             msg = f"VOLVIO A OK: Desplazamiento {disp_um:.1f} µm luego de {elapsed:.2f}s"
+#             print(f"[{datetime.fromtimestamp(ts_now)}] {msg}")
+#             log_event_to_files(ts_now, disp_um, "OK", msg, db_cursor)
+#         current_state = "OK"
+#         warning_since = None
 
-if __name__ == '__main__':
-    main()
+# # ---------- PLOT ----------
+# fig, (ax1, ax_disp) = plt.subplots(2, 1, figsize=(10, 8))
+# line_acc, = ax1.plot([], [], label='Aceleración (m/s²)'); ax1.grid(True); ax1.legend()
+# line_disp, = ax_disp.plot([], [], label='Microdesplazamiento (µm)'); ax_disp.grid(True); ax_disp.legend()
+# ax_disp.axhline(THRESH_OK_UM, linestyle='--', linewidth=1, label='OK threshold')
+# ax_disp.axhline(THRESH_ALERT_UM, linestyle='--', linewidth=1, label='ALERT threshold')
+# status_text = ax_disp.text(0.02, 0.95, '', transform=ax_disp.transAxes, fontsize=10, verticalalignment='top',
+#                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+# def safe_limits(data, pad=0.05):
+#     if not data: return -1.0, 1.0
+#     mn = min(data); mx = max(data)
+#     if math.isclose(mn, mx): mn -= 0.5; mx += 0.5
+#     rng = mx - mn
+#     return mn - pad*rng, mx + pad*rng
+
+# def update_plot(frame):
+#     with plot_lock:
+#         if not times:
+#             return line_acc, line_disp, status_text
+#         xs = list(times); accs = list(acc_mag); ds = list(disp_um_buf)
+#     t0 = xs[0]; x_rel = [xx - t0 for xx in xs]; tmax = x_rel[-1]
+#     line_acc.set_data(x_rel, accs); line_disp.set_data(x_rel, ds)
+#     xmin = max(0.0, tmax - HISTORY_SECONDS)
+#     ax1.set_xlim(xmin, tmax + 0.05); ax_disp.set_xlim(xmin, tmax + 0.05)
+#     aymin, aymax = safe_limits(accs); dmin, dmax = safe_limits(ds)
+#     ax1.set_ylim(aymin, aymax)
+#     ax_disp.set_ylim(min(dmin, -10), max(dmax*1.1, THRESH_ALERT_UM*1.2))
+#     status_text.set_text(f"Estado: {current_state}\nÚltimo disp: {ds[-1]:.1f} µm\nR(mm)={SENSOR_RADIUS_MM}")
+#     if current_state == "OK": ax_disp.set_facecolor((0.95,1.0,0.95))
+#     elif current_state == "WARNING": ax_disp.set_facecolor((1.0,1.0,0.8))
+#     else: ax_disp.set_facecolor((1.0,0.9,0.9))
+#     return line_acc, line_disp, status_text
+
+# # ---------- MAIN ----------
+# def start_producer():
+#     if MODE == 'simulate':
+#         t = threading.Thread(target=producer_simulate, daemon=True)
+#     elif MODE == 'serial':
+#         t = threading.Thread(target=producer_serial, daemon=True)
+#     else:
+#         raise ValueError("MODE inválido")
+#     t.start(); return t
+
+# def main():
+#     print("Iniciando monitor — MODE =", MODE)
+#     if MODE == 'serial' and serial is None:
+#         print("pyserial no instalado. Instala pyserial para usar serial.")
+#         return
+
+#     db_conn = init_db(SQLITE_DB)
+#     writer = threading.Thread(target=writer_thread_func, args=(db_conn,), daemon=True)
+#     writer.start()
+#     prod = start_producer()
+#     ani = animation.FuncAnimation(fig, update_plot, interval=200, cache_frame_data=False)
+#     plt.tight_layout()
+#     try:
+#         plt.show()
+#     except KeyboardInterrupt:
+#         print("Interrumpido por teclado.")
+#     finally:
+#         stop_event.set()
+#         time.sleep(0.5)
+#         try: db_conn.commit(); db_conn.close()
+#         except: pass
+#         print("Cerrado.")
+
+# if __name__ == '__main__':
+#     main()
+
+# // Sketch de diagnóstico final: I2C recovery + reintentos largos antes de declarar fallo
+#include <Arduino.h>
+#include <Wire.h>
+#include "ICM42688.h"
+
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const int INT_PIN = 5;
+ICM42688_FIFO imu(Wire, 0x68);
+
+void IRAM_ATTR onDataReady() {}
+
+void i2c_bus_recovery(int scl_pin, int sda_pin) {
+  pinMode(scl_pin, OUTPUT);
+  pinMode(sda_pin, INPUT_PULLUP);
+  digitalWrite(scl_pin, HIGH);
+  delay(5);
+  for (int i=0;i<9;i++){
+    digitalWrite(scl_pin, LOW); delayMicroseconds(500);
+    digitalWrite(scl_pin, HIGH); delayMicroseconds(500);
+  }
+  pinMode(sda_pin, OUTPUT);
+  digitalWrite(sda_pin, LOW); delayMicroseconds(200);
+  digitalWrite(scl_pin, HIGH); delayMicroseconds(200);
+  digitalWrite(sda_pin, HIGH); delayMicroseconds(200);
+  pinMode(scl_pin, INPUT_PULLUP);
+  pinMode(sda_pin, INPUT_PULLUP);
+  delay(50);
+}
+
+bool read_whoami_direct(uint8_t addr, uint8_t &who) {
+  Wire.beginTransmission(addr);
+  uint8_t et = Wire.endTransmission();
+  Serial.printf("probe endTransmission(0x%02X) => %u\n", addr, et);
+  Wire.beginTransmission(addr);
+  Wire.write(0x75);
+  uint8_t et2 = Wire.endTransmission(false);
+  if (et2 != 0) {
+    Serial.printf(" write reg 0x75 failed (et=%u)\n", et2);
+    return false;
+  }
+  Wire.requestFrom((int)addr, 1);
+  unsigned long start = millis();
+  while (millis() - start < 200 && Wire.available()==0) delay(1);
+  if (Wire.available()){
+    who = Wire.read();
+    return true;
+  }
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(1);
+  Serial.println("\nDIAGNOSTICO ICM42688 - intento final");
+  pinMode(INT_PIN, INPUT_PULLUP);
+
+  // advertencia: desconectar/reconectar VCC manualmente si lo puedes hacer
+  Serial.println("Si puedes: power-cycle del sensor ahora (desconectar VCC 2s y reconectar). Esperando 3s...");
+  delay(3000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(50);
+
+  i2c_bus_recovery(SCL_PIN, SDA_PIN);
+
+  uint8_t who=0xFF;
+  if (read_whoami_direct(0x68, who)) {
+    Serial.printf("WHO_AM_I direct 0x68 = 0x%02X\n", who);
+  } else Serial.println("WHO_AM_I direct 0x68 -> no leido");
+
+  // Intentos prolongados de imu.begin()
+  const int MAX_TRIES = 10;
+  for (int t = 1; t <= MAX_TRIES; ++t) {
+    Serial.printf("Intento imu.begin #%d ...\n", t);
+    Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(100000); delay(50);
+    int r = imu.begin();
+    Serial.printf(" imu.begin() returned %d\n", r);
+    if (r >= 0) {
+      Serial.println("imu.begin OK -> continuamos init normal");
+      // configuración mínima para test
+      imu.setAccelFS(ICM42688::gpm2);
+      imu.setAccelODR(ICM42688::odr12_5);
+      imu.enableFifo(true, true, false);
+      imu.enableDataReadyInterrupt();
+      attachInterrupt(digitalPinToInterrupt(INT_PIN), onDataReady, RISING);
+      Serial.println("Configuración hecha. Listo.");
+      while (1) delay(1000);
+    }
+    // si falló, intento liberar bus y espero cada vez más
+    i2c_bus_recovery(SCL_PIN, SDA_PIN);
+    Serial.println("Esperando 500 ms antes del siguiente intento...");
+    delay(500);
+  }
+
+  Serial.println("Todos los intentos fallaron. Próximos pasos:");
+  Serial.println(" 1) Añadir 2x 4.7k pull-ups a 3.3V en SDA/SCL si no las hay.");
+  Serial.println(" 2) Verificar continuity entre ESP SDA/SCL y pads del sensor.");
+  Serial.println(" 3) Probar módulo en otro MCU / adaptador USB-I2C.");
+  Serial.println(" 4) Si todo lo anterior ok -> reemplazar módulo.");
+}
+
+void loop() { delay(1000); }

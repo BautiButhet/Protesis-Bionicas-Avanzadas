@@ -1,123 +1,167 @@
-#include <Arduino.h>
-#include <SPI.h>
-#include "ICM42688.h"
+// main nuestro q deberia funcionar pero pincha al arrancar el sensor
+// // #include <Arduino.h>
+// // #include <SPI.h>
+// // #include "ICM42688.h"
 
-#define MAX_SAMPLES 128
-#define INT_PIN 5
+// // #define MAX_SAMPLES 128
+// // #define INT_PIN 5
+// // const int SDA_PIN = 21; // cambia si usas otros pines
+// // const int SCL_PIN = 22;
+// // void IRAM_ATTR onDataReady();
+// // // I2C bus y frecuencia
+// // ICM42688_FIFO imu(Wire, 0x68);
 
-// I2C bus y frecuencia
-ICM42688_FIFO imu(Wire, 0x69);//, 8000000); // SPI, CS pin, velocidad alta (8 MHz)
+// // float ax[MAX_SAMPLES], ay[MAX_SAMPLES], az[MAX_SAMPLES];
+// // //float gx[MAX_SAMPLES], gy[MAX_SAMPLES], gz[MAX_SAMPLES];
 
-float ax[MAX_SAMPLES], ay[MAX_SAMPLES], az[MAX_SAMPLES];
-//float gx[MAX_SAMPLES], gy[MAX_SAMPLES], gz[MAX_SAMPLES];
+// // const float SENSOR_ODR_HZ = 12.5f; //1000.0;  // Tasa de muestreo esperada (en Hz) const float SENSOR_ODR_HZ = 12.5f;  // <-- Debe coincidir con la ODR configurada en el sensor
+// // uint32_t lastReadMs = 0;
+// // const uint32_t readIntervalMs = 50; // Intervalo de lectura (cada 50 ms)
+// // volatile bool dataReady = false;
+// // void setup() {
+// //   Serial.begin(115200);
+// //   while (!Serial);
+// //   Wire.begin(SDA_PIN, SCL_PIN);       // explícito para ESP32
+// //   // pinMode(INT_PIN, INPUT_PULLUP);
 
-const float SENSOR_ODR_HZ = 12.5f; //1000.0;  // Tasa de muestreo esperada (en Hz) const float SENSOR_ODR_HZ = 12.5f;  // <-- Debe coincidir con la ODR configurada en el sensor
-uint32_t lastReadMs = 0;
-const uint32_t readIntervalMs = 50; // Intervalo de lectura (cada 50 ms)
-volatile bool dataReady = false;
+// //  // Inicializar sensor
+// //   if(imu.begin() < 0) 
+// //   {
+// //     Serial.println("ERROR iniciando ICM-42688 aaaaaaaa");
+// //     while (1) { delay(1000); }
+// //   }
+// //   Serial.println("ICM-42688 iniciado correctamente.");
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial);
-  Wire.begin();
-  pinMode(INT_PIN, INPUT_PULLUP);
+// //   // Rangos de operación más sensibles // ±2g y ±250 °/s
+// //   if(imu.setAccelFS(ICM42688::gpm2) < 0)
+// //   {
+// //     Serial.println("ERROR iniciando la sensibilidad del acelerometro ICM-42688");
+// //     while (1) { delay(1000); }
+// //   }    
+// //   // if(imu.setGyroFS(ICM42688::dps250) < 0)  
+// //   // {
+// //   //   Serial.println("ERROR iniciando la sensibilidad del giroscopio ICM-42688");
+// //   //   while (1) { delay(1000); }
+// //   // }  
 
- // Inicializar sensor
-  if(imu.begin() < 0) 
-  {
-    Serial.println("ERROR iniciando ICM-42688");
-    while (1) { delay(1000); }
-  }
-  Serial.println("ICM-42688 iniciado correctamente.");
+// //   // set output data rate to 12.5 Hz
+// // 	imu.setAccelODR(ICM42688::odr12_5);
+// // 	// imu.setGyroODR(ICM42688::odr12_5);
 
-  // Rangos de operación más sensibles // ±2g y ±250 °/s
-  if(imu.setAccelFS(ICM42688::gpm2) < 0)
-  {
-    Serial.println("ERROR iniciando la sensibilidad del acelerometro ICM-42688");
-    while (1) { delay(1000); }
-  }    
-  // if(imu.setGyroFS(ICM42688::dps250) < 0)  
-  // {
-  //   Serial.println("ERROR iniciando la sensibilidad del giroscopio ICM-42688");
-  //   while (1) { delay(1000); }
-  // }  
+// //   // Configurar FIFO (acelerómetro + giroscopio)
+// //   if(imu.enableFifo(true, true, false) < 0)
+// //   {
+// //     Serial.println("ERROR activando la configuracion FIFO del ICM-42688");
+// //     while (1) { delay(1000); }
+// //   }  
+// //   if(imu.enableDataReadyInterrupt() < 0)
+// //   {
+// //     Serial.println("ERROR iniciando el INT data-ready");
+// //     while (1) { delay(1000); }
+// //   }  
 
-  // set output data rate to 12.5 Hz
-	imu.setAccelODR(ICM42688::odr12_5);
-	// imu.setGyroODR(ICM42688::odr12_5);
+// //   attachInterrupt(digitalPinToInterrupt(INT_PIN), onDataReady, RISING);
 
-  // Configurar FIFO (acelerómetro + giroscopio)
-  if(imu.enableFifo(true, true, false) < 0)
-  {
-    Serial.println("ERROR activando la configuracion FIFO del ICM-42688");
-    while (1) { delay(1000); }
-  }  
-  if(imu.enableDataReadyInterrupt() < 0)
-  {
-    Serial.println("ERROR iniciando el INT data-ready");
-    while (1) { delay(1000); }
-  }  
+// //   Serial.println("FIFO activado; INT data-ready también.");
+// // }
 
-  attachInterrupt(digitalPinToInterrupt(INT_PIN), onDataReady, RISING);
+// // void IRAM_ATTR onDataReady() 
+// // {
+// //   dataReady = true;
+// // }
 
-  Serial.println("FIFO activado; INT data-ready también.");
-}
+// // void loop() {
+// //   uint32_t now = millis();
 
-void IRAM_ATTR onDataReady() 
-{
-  dataReady = true;
-}
+// //   if (now - lastReadMs >= readIntervalMs || dataReady) 
+// //   {
+// //     dataReady = false;
+// //     lastReadMs = now;
 
-void loop() {
-  uint32_t now = millis();
+// //     // read del sensor
+// //     imu.getAGT();
 
-  if (now - lastReadMs >= readIntervalMs || dataReady) 
-  {
-    dataReady = false;
-    lastReadMs = now;
+// //     if (imu.readFifo() < 0) {
+// //       Serial.println("Overflow o error en FIFO. Reseteando...");
+// //       delay(5);
+// //       imu.enableFifo(true, true, false);
+// //       return;
+// //     }
 
-    // read del sensor
-    imu.getAGT();
+// //     size_t n = 0;
+// //     imu.getFifoAccelX_mss(&n, nullptr);
+// //     if (n == 0) return;  // Si no hay muestras, salto
 
-    if (imu.readFifo() < 0) {
-      Serial.println("Overflow o error en FIFO. Reseteando...");
-      delay(5);
-      imu.enableFifo(true, true, false);
-      return;
-    }
+// //     // limitamos lectura a MAX_SAMPLES
+// //     size_t toRead = min(n, (size_t)MAX_SAMPLES);
 
-    size_t n = 0;
-    imu.getFifoAccelX_mss(&n, nullptr);
-    if (n == 0) return;  // Si no hay muestras, salto
+// //     //float ax[n], ay[n], az[n], gx[n], gy[n], gz[n];
 
-    // limitamos lectura a MAX_SAMPLES
-    size_t toRead = min(n, (size_t)MAX_SAMPLES);
+// //     size_t nAccel = toRead;
+// //     imu.getFifoAccelX_mss(&nAccel, ax);
+// //     imu.getFifoAccelY_mss(&nAccel, ay);
+// //     imu.getFifoAccelZ_mss(&nAccel, az);
 
-    //float ax[n], ay[n], az[n], gx[n], gy[n], gz[n];
+// //     // size_t nGyro = 0;
+// //     // imu.getFifoGyroX(&nGyro, gx);
+// //     // imu.getFifoGyroY(&nGyro, gy);
+// //     // imu.getFifoGyroZ(&nGyro, gz);
 
-    size_t nAccel = toRead;
-    imu.getFifoAccelX_mss(&nAccel, ax);
-    imu.getFifoAccelY_mss(&nAccel, ay);
-    imu.getFifoAccelZ_mss(&nAccel, az);
+// //     // size_t nValido = min(nAccel, nGyro); // número de muestras coherente
 
-    // size_t nGyro = 0;
-    // imu.getFifoGyroX(&nGyro, gx);
-    // imu.getFifoGyroY(&nGyro, gy);
-    // imu.getFifoGyroZ(&nGyro, gz);
+// //     unsigned long t_read = micros();
+// //     double dt_us = 1000000.0 / SENSOR_ODR_HZ; // debe coincidir con ODR
 
-    // size_t nValido = min(nAccel, nGyro); // número de muestras coherente
+// //     for (size_t i = 0; i < nAccel; ++i) {
+// //       unsigned long ts = (unsigned long)(t_read - (unsigned long)((nAccel - 1 - i) * dt_us));
+// //       Serial.printf("%lu,%.6f,%.6f,%.6f\n", ts, ax[i], ay[i], az[i]);//, gx[i], gy[i], gz[i]);
+// //     }
+// //     // si había más muestras en el FIFO que MAX_SAMPLES, la próxima iteración las leerá
+// //   }
+// //   // pequeña pausa para que no consuma toda la CPU
+// //   delay(1);
+// // }
 
-    unsigned long t_read = micros();
-    double dt_us = 1000000.0 / SENSOR_ODR_HZ; // debe coincidir con ODR
 
-    for (size_t i = 0; i < nAccel; ++i) {
-      unsigned long ts = (unsigned long)(t_read - (unsigned long)((nAccel - 1 - i) * dt_us));
-      Serial.printf("%lu,%.6f,%.6f,%.6f\n", ts, ax[i], ay[i], az[i]);//, gx[i], gy[i], gz[i]);
-    }
-    // si había más muestras en el FIFO que MAX_SAMPLES, la próxima iteración las leerá
-  }
-  // pequeña pausa para que no consuma toda la CPU
-  delay(1);
-}
+// esto viene del git de finani
+// #include "ICM42688.h"
 
-//comentario chupete chupeton
+// // an ICM42688 object with the ICM42688 sensor on I2C bus with address 0x68 for Arduino
+// ICM42688 IMU(Wire, 0x68);
+
+// void setup() {
+// 	// serial to display data
+// 	Serial.begin(115200);
+// 	while (!Serial) {}
+
+// 	// start communication with IMU
+// 	int status = IMU.begin();
+// 	if (status < 0) {
+// 		Serial.println("IMU initialization unsuccessful");
+// 		Serial.println("Check IMU wiring or try cycling power");
+// 		Serial.print("Status: ");
+// 		Serial.println(status);
+// 		while (1) {}
+// 	}
+// 	Serial.println("ax,ay,az,gx,gy,gz,temp_C");
+// }
+
+// void loop() {
+// 	// read the sensor
+// 	IMU.getAGT();
+// 	// display the data
+// 	Serial.print(IMU.accX(), 6);
+// 	Serial.print("\t");
+// 	Serial.print(IMU.accY(), 6);
+// 	Serial.print("\t");
+// 	Serial.print(IMU.accZ(), 6);
+// 	Serial.print("\t");
+// 	Serial.print(IMU.gyrX(), 6);
+// 	Serial.print("\t");
+// 	Serial.print(IMU.gyrY(), 6);
+// 	Serial.print("\t");
+// 	Serial.print(IMU.gyrZ(), 6);
+// 	Serial.print("\t");
+// 	Serial.println(IMU.temp(), 6);
+// 	delay(100);
+// }

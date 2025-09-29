@@ -1,0 +1,30 @@
+#include <Wire.h> // include Wire library
+#include <HardwareSerial.h>
+// #include "ICM42688.h"
+
+
+// an ICM42688 object with the ICM42688 sensor on I2C bus with address 0x68 for Arduino
+// ICM42688 IMU(Wire, 0x68);
+int device = 0; // set device counter
+void setup()
+{
+ Serial.begin (115200); // Serial Monitor baud rate
+ Serial.println();
+ Wire.begin(); // start I2C bus
+ for (int i=8; i<127; i++) // scan through channels 8 to 126
+ {
+ Wire.beginTransmission (i); // transmit to device at address i
+ 
+ if (Wire.endTransmission () == 0) 
+ { // device response to transmission
+ Serial.print("Address 0x");
+ Serial.println(i, HEX); // display I2C address in HEX
+ device++; // increment device count
+ delay(10);
+ }
+ }
+ Serial.print(device); // display device count
+ Serial.println(" device found");
+}
+void loop() // nothing in loop function
+{}
