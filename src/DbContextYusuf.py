@@ -387,6 +387,7 @@ def writer_thread_func():
 
             # vaciar buffer para la próxima ventana (no solapado)
             samples_buffer.clear()
+            
 # --------------- ARRANQUE -----------------
 def start_producer():
     if MODE == 'simulate':
