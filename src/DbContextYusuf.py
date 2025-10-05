@@ -17,10 +17,12 @@ from datetime import datetime, timezone
 from supabase import create_client
 from collections import deque
 from dotenv import load_dotenv
+from statistics import pstdev
 
 # ventana de integración (segundos)
 ACC_WINDOW_SECONDS = 2.0
 acc_window = deque()
+
 # carga .env si existe
 load_dotenv()  
 # ----------------- CONFIG from ENV (secure) -----------------
@@ -55,6 +57,10 @@ THRESH_ALERT_UM = 150.0
 # ----------------- QUEUES / FLAGS -----------------
 row_queue = queue.Queue(maxsize=20000)
 stop_event = threading.Event()
+
+SAMPLES_PER_INSERT = int(round(1.0 / SAMPLE_INTERVAL)) if SAMPLE_INTERVAL > 0 else 20
+# buffer para promediar las N muestras antes de insertar
+samples_buffer = deque(maxlen=SAMPLES_PER_INSERT)
 
 # state
 current_state = "OK"
@@ -223,7 +229,7 @@ def alert_and_log(desp_um, ts_s):
             duration_s = None
             if warning_since:
                 duration_s = ts_s - warning_since
-            msg = f"VOLVIO A OK: desp {desp_um:.1f} µm"
+            msg = f"VOLVIO A OK"
             print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
 
             if current_event_id is not None:
@@ -232,16 +238,6 @@ def alert_and_log(desp_um, ts_s):
                 }
                 ok = _update_event(current_event_id, updates)
                 current_event_id = None
-            # else:
-            #     # no teníamos event_id: insertar registro de retorno a OK
-            #     payload = {
-            #         "sensor_id": SENSOR_ID,
-            #         "timestamp": ts_iso,
-            #         "desp_um": desp_um,
-            #         "estado_lectura": "OK",
-            #         "message": msg
-            #     }
-            #     _insert_event(payload)
 
             warning_since = None
             current_state = "OK"
@@ -310,6 +306,11 @@ def compute_desp_from_acc_window(ts, ax, ay, az):
     return abs(p2p_m * 1e6)
 
 def writer_thread_func():
+    """
+    Consume muestras individuales (ts, ax, ay, az) del row_queue,
+    calcula desp_um por ventana y guarda únicamente el promedio de
+    SAMPLES_PER_INSERT muestras en la tabla 'lectura'.
+    """
     count = 0
     while not stop_event.is_set():
         try:
@@ -317,31 +318,76 @@ def writer_thread_func():
         except queue.Empty:
             continue
 
+        # cálculo por muestra
         acc_mag = math.sqrt(ax*ax + ay*ay + az*az)
         desp_um = compute_desp_from_acc_window(ts, ax, ay, az)
 
-        estado_lectura = alert_and_log(desp_um, ts)
-        estado_lectura = (estado_lectura or "OK").upper()
-
-        ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        payload = {
-            "sensor_id": SENSOR_ID,
-            "timestamp": ts_iso,
+        # apilar la muestra en el buffer (guardamos ts como float)
+        samples_buffer.append({
+            "ts": float(ts),     # <-- mantener float para poder promediar
             "ax": ax,
             "ay": ay,
             "az": az,
             "a_total": acc_mag,
-            "estado_lectura": estado_lectura,
             "desp_um": desp_um
-        }
+        })
 
         count += 1
-        if count % 20 == 0:
-            safe_insert("lectura", payload)
-        if count % 20 == 0:
-            print(f"[{datetime.fromtimestamp(ts)}] sample #{count}: desp={desp_um:.2f} µm estado={estado_lectura}")
 
-# ----------------- ARRANQUE -----------------
+        # cada SAMPLES_PER_INSERT muestras calculamos el promedio y lo guardamos
+        if len(samples_buffer) >= SAMPLES_PER_INSERT:
+            n = len(samples_buffer)
+            # sumarizar/normalizar (usamos math.fsum para más precisión si querés)
+            sum_ts = sum(item["ts"] for item in samples_buffer)
+            sum_ax = sum(item["ax"] for item in samples_buffer)
+            sum_ay = sum(item["ay"] for item in samples_buffer)
+            sum_az = sum(item["az"] for item in samples_buffer)
+            sum_atot = sum(item["a_total"] for item in samples_buffer)
+            sum_desp = sum(item["desp_um"] for item in samples_buffer)
+
+            avg_ts = sum_ts / n
+            avg_ax = sum_ax / n
+            avg_ay = sum_ay / n
+            avg_az = sum_az / n
+            avg_atot = sum_atot / n
+            avg_desp = sum_desp / n
+
+            # desviación de las muestras de desplazamiento (informativa)
+            try:
+                desp_std = pstdev([item["desp_um"] for item in samples_buffer])
+            except Exception:
+                desp_std = 0.0
+
+            # Generar estado basado en el valor promedio de desplazamiento
+            estado_lectura = alert_and_log(avg_desp, avg_ts)
+            estado_lectura = (estado_lectura or "OK").upper()
+
+            # timestamp ISO para la insert
+            ts_iso = datetime.fromtimestamp(avg_ts, tz=timezone.utc).isoformat()
+
+            payload = {
+                "sensor_id": SENSOR_ID,
+                "timestamp": ts_iso,
+                "ax": avg_ax,
+                "ay": avg_ay,
+                "az": avg_az,
+                "a_total": avg_atot,
+                "estado_lectura": estado_lectura,
+                "desp_um": avg_desp,
+                "desp_std": desp_std,
+            }
+
+            # insertar promedio en Supabase
+            ok = safe_insert("lectura", payload)
+            if ok:
+                print(f"[{datetime.fromtimestamp(avg_ts)}] INSERT promedio #{count//SAMPLES_PER_INSERT}: "
+                      f"desp_avg={avg_desp:.2f} µm std={desp_std:.2f} µm estado={estado_lectura}")
+            else:
+                print(f"[{datetime.fromtimestamp(avg_ts)}] ERROR INSERT promedio disp={avg_desp:.2f} µm estado={estado_lectura}")
+
+            # vaciar buffer para la próxima ventana (no solapado)
+            samples_buffer.clear()
+# --------------- ARRANQUE -----------------
 def start_producer():
     if MODE == 'simulate':
         t = threading.Thread(target=producer_simulate, daemon=True)
