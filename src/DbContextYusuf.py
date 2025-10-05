@@ -35,7 +35,9 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 # $env:SUPABASE_URL  = "https://vnkbnqdjlgzwnzpsvxdd.supabase.co"
 # $env:SUPABASE_KEY  = "TU_ANON_O_SERVICE_ROLE_KEY_AQUI"
 # $env:SENSOR_ID     = "4"   
+
 # o
+
 # @"
 # SUPABASE_URL=https://vnkbnqdjlgzwnzpsvxdd.supabase.co
 # SUPABASE_KEY=TU_ANON_O_SERVICE_ROLE_KEY_AQUI
@@ -44,27 +46,21 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ----------------- GENERAL CONFIG -----------------
 MODE = 'simulate'        # 'simulate' | 'serial'
-SAMPLE_INTERVAL = 0.05   # s -> 20 Hz en simulate
+SAMPLE_INTERVAL = 0.05   # s -> 20 Hz en simulate / 20 muestras por segundo
 
 # umbrales (µm)
 THRESH_OK_UM = 50.0
 THRESH_ALERT_UM = 150.0
-SUSTAIN_SECONDS_MIN = 2.5
-
-# buffer / retry policy
-API_RETRY_PAUSE = 5.0    # wait seconds after API error before retrying
-BATCH_INSERT_SIZE = 20
 
 # ----------------- QUEUES / FLAGS -----------------
 row_queue = queue.Queue(maxsize=20000)
-insert_buffer = []              # buffered payloads when API failing
-buffer_lock = threading.Lock()
 stop_event = threading.Event()
 
 # state
 current_state = "OK"
 warning_since = None
 state_lock = threading.Lock()
+current_event_id = None
 
 # ----------------- PRODUCER SIMULATE -----------------
 def producer_simulate(produce_interval=SAMPLE_INTERVAL,
@@ -107,7 +103,8 @@ def producer_serial(port='COM3', baud=115200):
             parts = line.split(',')
             if len(parts) < 4:
                 continue
-            ts_us = float(parts[0]); ts = ts_us / 1e6
+            ts_us = float(parts[0]); 
+            ts = ts_us / 1e6
             ax = float(parts[1]); ay = float(parts[2]); az = float(parts[3])
             try:
                 row_queue.put([ts, ax, ay, az], timeout=0.3)
@@ -120,63 +117,137 @@ def producer_serial(port='COM3', baud=115200):
 
 # ----------------- ALERTS & EVENTS -----------------
 def _insert_event(payload):
-    """Try to insert an event into supabase; if fails, buffer it."""
+    """
+    Inserta un evento en la tabla 'evento'.
+    Devuelve el id insertado (int) si tuvo éxito, o None si falló.
+    """
     try:
-        r = sb.table("eventos").insert(payload).execute()
-        return True
+        # pedimos que retorne el id del registro insertado
+        res = sb.table("evento").insert(payload).execute()
+        # res.data normalmente es una lista de dicts con el registro insertado
+        data = getattr(res, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            row = data[0]
+        # intenta varios nombres posibles (ajusta si tu PK tiene otro nombre)
+            eid = row.get("evento_id")
+            if eid is not None:
+                return eid
+            return None 
     except Exception as e:
         print("Error inserting event to Supabase:", e)
-        # buffer it
-        with buffer_lock:
-            insert_buffer.append(("eventos", payload))
-        return False
+        return None
+
+def _update_event(event_id, updates):
+    """
+    Actualiza el evento con id = event_id.
+    Devuelve True si actualizó, False si falló.
+    """
+    try:
+        # actualizamos la fila con la PK event_id
+        res = sb.table("evento").update(updates).eq("evento_id", event_id).execute()
+        return True
+    except Exception as e:
+        print("Error updating event into Supabase:", e)
+    return False     
 
 def alert_and_log(desp_um, ts_s):
-    global current_state, warning_since
+    """
+    Actualiza el estado global y crea/actualiza eventos en la tabla 'eventos'.
+    - Cuando pasa a WARNING o ALERT se inserta un evento y se guarda su id en current_event_id.
+    - Cuando vuelve a OK se intenta actualizar el evento correspondiente.
+    """
+    global current_state, warning_since, current_event_id
     with state_lock:
+        ts_iso = datetime.fromtimestamp(ts_s, tz=timezone.utc).isoformat()
         if desp_um > THRESH_ALERT_UM:
             if current_state != "ALERT":
-                current_state = "ALERT"
-                warning_since = None
-                msg = f"ALERTA INMEDIATA: disp {desp_um:.1f} µm > {THRESH_ALERT_UM} µm"
-                print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
-                # _insert_event({
-                #     "sensor_id": SENSOR_ID,
-                #     "ts_s": ts_s,
-                #     "disp_um": disp_um,
-                #     "level": "ALERT",
-                #     "message": msg
-                # })
-            return "ALERT"
-        if desp_um > THRESH_OK_UM:         
-                if current_state != "WARNING":
-                        current_state = "WARNING"
-                        msg = f"ADVERTENCIA: disp {desp_um:.1f} µm"
-                        print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
-                        # _insert_event({
-                        #     "sensor_id": SENSOR_ID,
-                        #     "ts_s": ts_s,
-                        #     "disp_um": disp_um,
-                        #     "level": "WARNING",
-                        #     "message": msg
-                        # })
-                return "WARNING"
-        else:
-            if current_state != "OK":
-                msg = f"VOLVIO A OK: disp {desp_um:.1f} µm"
-                print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
-                # _insert_event({
+                duration_s = None
+                if warning_since:
+                    duration_s = ts_s - warning_since
+                if current_event_id is not None:
+                    updates = {
+                        "event_duration": duration_s if duration_s is not None else 0.0,
+                    }
+                    ok = _update_event(current_event_id, updates)
+                    current_event_id = None
                 
-                #     "sensor_id": SENSOR_ID,
-                #     "ts_s": ts_s,
-                #     "disp_um": disp_um,
-                #     "level": "OK",
-                #     "message": msg
-                # })
+                current_state = "ALERT"
+                warning_since = ts_s
+                msg = f"ALERTA INMEDIATA: desp {desp_um:.1f} µm > {THRESH_ALERT_UM} µm"
+                payload = {
+                    "sensor_id": SENSOR_ID,
+                    "timestamp": ts_iso,
+                    "desp_um": desp_um,
+                    "estado_lectura": "ALERT",
+                    "message": msg
+                }
+                eid = _insert_event(payload)
+                if eid:
+                    current_event_id = eid
+                else:
+                    current_event_id = None
+                print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
+            return "ALERT"
+
+        if desp_um > THRESH_OK_UM:
+            if current_state != "WARNING":
+                duration_s = None
+                if warning_since:
+                    duration_s = ts_s - warning_since
+                if current_event_id is not None:
+                    updates = {
+                        "event_duration": duration_s if duration_s is not None else 0.0,
+                    }
+                    ok = _update_event(current_event_id, updates)
+                    current_event_id = None
+                
+                current_state = "WARNING"
+                warning_since = ts_s
+                msg = f"ADVERTENCIA: desp {desp_um:.1f} µm > {THRESH_OK_UM} µm"
+                payload = {
+                    "sensor_id": SENSOR_ID,
+                    "timestamp": ts_iso,
+                    "desp_um": desp_um,
+                    "estado_lectura": "WARNING",
+                    "message": msg
+                }
+                eid = _insert_event(payload)
+                if eid:
+                    current_event_id = eid
+                else:
+                    current_event_id = None
+                print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
+            return "WARNING"
+
+        if current_state != "OK":
+            duration_s = None
+            if warning_since:
+                duration_s = ts_s - warning_since
+            msg = f"VOLVIO A OK: desp {desp_um:.1f} µm"
+            print(f"[{datetime.fromtimestamp(ts_s)}] {msg}")
+
+            if current_event_id is not None:
+                updates = {
+                    "event_duration": duration_s if duration_s is not None else 0.0,
+                }
+                ok = _update_event(current_event_id, updates)
+                current_event_id = None
+            # else:
+            #     # no teníamos event_id: insertar registro de retorno a OK
+            #     payload = {
+            #         "sensor_id": SENSOR_ID,
+            #         "timestamp": ts_iso,
+            #         "desp_um": desp_um,
+            #         "estado_lectura": "OK",
+            #         "message": msg
+            #     }
+            #     _insert_event(payload)
+
             warning_since = None
             current_state = "OK"
             return "OK"
-
+        # estado no cambiado
+        return current_state
 
 # ----------------- WRITER (procesa y envia lecturas) -----------------
 def safe_insert(table, payload):
@@ -190,13 +261,9 @@ def safe_insert(table, payload):
         print(f"Error inserting to Supabase ({table}):", e)
         api_ok = False
         last_api_error_time = time.time()
-        with buffer_lock:
-            insert_buffer.append((table, payload))
         return False
 
-
 # ---------- CÁLCULOS ----------
-
 def compute_desp_from_acc_window(ts, ax, ay, az):
     """
     Integra en ventana de tiempo para estimar desplazamiento pico-a-pico (µm).
@@ -242,7 +309,6 @@ def compute_desp_from_acc_window(ts, ax, ay, az):
     p2p_m = max(ss) - min(ss)
     return abs(p2p_m * 1e6)
 
-
 def writer_thread_func():
     count = 0
     while not stop_event.is_set():
@@ -274,7 +340,6 @@ def writer_thread_func():
             safe_insert("lectura", payload)
         if count % 20 == 0:
             print(f"[{datetime.fromtimestamp(ts)}] sample #{count}: desp={desp_um:.2f} µm estado={estado_lectura}")
-
 
 # ----------------- ARRANQUE -----------------
 def start_producer():
