@@ -68,6 +68,55 @@ warning_since = None
 state_lock = threading.Lock()
 current_event_id = None
 
+# ---------- helpers supabase ----------
+def sb_select_sensors():
+    """Devuelve lista de sensores {sensor_id, device_serial, enabled}"""
+    try:
+        res = sb.table("sensor").select("sensor_id,device_serial,enabled").execute()
+        data = getattr(res, "data", None)
+        if data and isinstance(data, list):
+            return data
+    except Exception as e:
+        print("Error leyendo sensors:", e)
+    return []
+
+def safe_insert(table, payload):
+    """Try single insert; on failure buffer it."""
+    try:
+        r = sb.table(table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error inserting to Supabase ({table}):", e)
+        return False
+    
+def _insert_event(payload):
+    """
+    Inserta un evento en la tabla 'evento'.
+    Devuelve el id insertado (int) si tuvo éxito, o None si falló.
+    """
+    try:
+        # pedimos que retorne el id del registro insertado
+        res = sb.table("evento").insert(payload).execute()
+        data = getattr(res, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0].get("evento_id")
+    except Exception as e:
+        print("Error inserting event to Supabase:", e)
+        return None
+    
+def _update_event(event_id, updates):
+    """
+    Actualiza el evento con id = event_id.
+    Devuelve True si actualizó, False si falló.
+    """
+    try:
+        # actualizamos la fila con la PK event_id
+        sb.table("evento").update(updates).eq("evento_id", event_id).execute()
+        return True
+    except Exception as e:
+        print("Error updating event into Supabase:", e)
+    return False  
+
 # ----------------- PRODUCER SIMULATE -----------------
 def producer_simulate(produce_interval=SAMPLE_INTERVAL,
                       total_disp_target_um=150.0,
@@ -121,39 +170,7 @@ def producer_serial(port='COM3', baud=115200):
     try: ser.close()
     except: pass
 
-# ----------------- ALERTS & EVENTS -----------------
-def _insert_event(payload):
-    """
-    Inserta un evento en la tabla 'evento'.
-    Devuelve el id insertado (int) si tuvo éxito, o None si falló.
-    """
-    try:
-        # pedimos que retorne el id del registro insertado
-        res = sb.table("evento").insert(payload).execute()
-        data = getattr(res, "data", None)
-        if data and isinstance(data, list) and len(data) > 0:
-            row = data[0]
-            eid = row.get("evento_id")
-            if eid is not None:
-                return eid
-            return None 
-    except Exception as e:
-        print("Error inserting event to Supabase:", e)
-        return None
-
-def _update_event(event_id, updates):
-    """
-    Actualiza el evento con id = event_id.
-    Devuelve True si actualizó, False si falló.
-    """
-    try:
-        # actualizamos la fila con la PK event_id
-        res = sb.table("evento").update(updates).eq("evento_id", event_id).execute()
-        return True
-    except Exception as e:
-        print("Error updating event into Supabase:", e)
-    return False     
-
+# ----------------- ALERTS & EVENTS -----------------   
 def alert_and_log(desp_um, ts_s):
     """
     Actualiza el estado global y crea/actualiza eventos en la tabla 'eventos'.
@@ -243,20 +260,6 @@ def alert_and_log(desp_um, ts_s):
         # estado no cambiado
         return current_state
 
-# ----------------- WRITER (procesa y envia lecturas) -----------------
-def safe_insert(table, payload):
-    """Try single insert; on failure buffer it."""
-    global api_ok, last_api_error_time
-    try:
-        r = sb.table(table).insert(payload).execute()
-        api_ok = True
-        return True
-    except Exception as e:
-        print(f"Error inserting to Supabase ({table}):", e)
-        api_ok = False
-        last_api_error_time = time.time()
-        return False
-
 # ---------- CÁLCULOS ----------
 def compute_desp_from_acc_window(ts, ax, ay, az):
     """
@@ -303,6 +306,7 @@ def compute_desp_from_acc_window(ts, ax, ay, az):
     p2p_m = max(ss) - min(ss)
     return abs(p2p_m * 1e6)
 
+# ----------------- WRITER (procesa y envia lecturas) -----------------
 def writer_thread_func():
     """
     Consume muestras individuales (ts, ax, ay, az) del row_queue,
