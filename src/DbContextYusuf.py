@@ -130,11 +130,9 @@ def _insert_event(payload):
     try:
         # pedimos que retorne el id del registro insertado
         res = sb.table("evento").insert(payload).execute()
-        # res.data normalmente es una lista de dicts con el registro insertado
         data = getattr(res, "data", None)
         if data and isinstance(data, list) and len(data) > 0:
             row = data[0]
-        # intenta varios nombres posibles (ajusta si tu PK tiene otro nombre)
             eid = row.get("evento_id")
             if eid is not None:
                 return eid
