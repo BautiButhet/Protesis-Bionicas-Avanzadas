@@ -27,8 +27,10 @@ THRESH_ALERT_UM = float(os.environ.get("THRESH_ALERT_UM", "150.0"))
 ACC_WINDOW_SECONDS = float(os.environ.get("ACC_WINDOW_SECONDS", "2.0"))
 
 # ----------------- Supabase client -----------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# SUPABASE_URL = os.environ.get("SUPABASE_URL")
+# SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
