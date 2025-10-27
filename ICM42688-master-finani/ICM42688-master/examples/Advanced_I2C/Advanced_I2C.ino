@@ -1,11 +1,11 @@
 #include "ICM42688.h"
 
-// an ICM42688 object with the ICM42688 sensor on I2C bus with address 0x68 for Arduino
-ICM42688 IMU(Wire, 0x68);
+// an ICM42688 object with the ICM42688 sensor on I2C bus with address 0x68 using SDA pin 18 and SCL pin 19 for Arduino (21, 22 for ESP32)
+ICM42688 IMU(Wire, 0x68, 18, 19);
 
 void setup() {
 	// serial to display data
-	Serial.begin(115200);
+	Serial.begin(115'200);
 	while (!Serial) {}
 
 	// start communication with IMU
@@ -17,12 +17,23 @@ void setup() {
 		Serial.println(status);
 		while (1) {}
 	}
+
+	// setting the accelerometer full scale range to +/-8G
+	IMU.setAccelFS(ICM42688::gpm8);
+	// setting the gyroscope full scale range to +/-500 deg/s
+	IMU.setGyroFS(ICM42688::dps500);
+
+	// set output data rate to 12.5 Hz
+	IMU.setAccelODR(ICM42688::odr12_5);
+	IMU.setGyroODR(ICM42688::odr12_5);
+
 	Serial.println("ax,ay,az,gx,gy,gz,temp_C");
 }
 
 void loop() {
 	// read the sensor
 	IMU.getAGT();
+
 	// display the data
 	Serial.print(IMU.accX(), 6);
 	Serial.print("\t");
@@ -37,5 +48,5 @@ void loop() {
 	Serial.print(IMU.gyrZ(), 6);
 	Serial.print("\t");
 	Serial.println(IMU.temp(), 6);
-	delay(100);
+	delay(20);
 }

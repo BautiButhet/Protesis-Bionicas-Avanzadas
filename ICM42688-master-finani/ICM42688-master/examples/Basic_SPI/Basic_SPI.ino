@@ -1,11 +1,11 @@
 #include "ICM42688.h"
 
-// an ICM42688 object with the ICM42688 sensor on I2C bus with address 0x68 for Arduino
-ICM42688 IMU(Wire, 0x68);
+// an ICM42688 object with the ICM42688 sensor on SPI bus 0 and chip select pin 10
+ICM42688 IMU(SPI, 10);
 
 void setup() {
 	// serial to display data
-	Serial.begin(115200);
+	Serial.begin(115'200);
 	while (!Serial) {}
 
 	// start communication with IMU
