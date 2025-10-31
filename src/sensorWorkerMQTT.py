@@ -14,10 +14,7 @@ except Exception:
     serial = None
     list_ports = None
 
-# $env:SUPABASE_URL="https://vnkbnqdjlgzwnzpsvxdd.supabase.co"
-# $env:SUPABASE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZua2JucWRqbGd6d256cHN2eGRkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTkyNTI3ODYsImV4cCI6MjA3NDgyODc4Nn0.m4e5JB3Yk3Bq5Q3TjnecolfY6pk-r_29JkDjCbxZkoY"
-
-# --- 3. Carga Robusta de.env [15, 18, 20] ---
+# --- Carga Robusta de.env [15, 18, 20] ---
 # Resuelve la ruta absoluta al directorio de este script
 BASE_DIR = Path(__file__).resolve().parent
 # Carga el archivo.env desde ese directorio
@@ -31,14 +28,14 @@ PREFERRED_PORT = os.environ.get("SERIAL_PORT", "COM3")
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "115200"))
 CONTROL_POLL_INTERVAL = float(os.environ.get("CONTROL_POLL_INTERVAL", "1.0"))
 SERIAL_SCAN_INTERVAL = float(os.environ.get("SERIAL_SCAN_INTERVAL", "1.0"))
-SAMPLE_INTERVAL = float(os.environ.get("SAMPLE_INTERVAL", "0.05"))
+SAMPLE_INTERVAL = float(os.environ.get("SAMPLE_INTERVAL", "0.005"))
 SIMULATE_TARGET_UM = float(os.environ.get("SIMULATE_TARGET_UM", "150.0"))
 SIMULATE_DURATION_S = float(os.environ.get("SIMULATE_DURATION_S", "10.0"))
 THRESH_OK_UM = float(os.environ.get("THRESH_OK_UM", "50.0"))
 THRESH_ALERT_UM = float(os.environ.get("THRESH_ALERT_UM", "150.0"))
-ACC_WINDOW_SECONDS = float(os.environ.get("ACC_WINDOW_SECONDS", "2.0"))
+ACC_WINDOW_SECONDS = float(os.environ.get("ACC_WINDOW_SECONDS", "0.08"))
 
-# --- 4. Configuración MQTT ---
+# --- Configuración MQTT ---
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost") # "localhost" si usas Docker, o "broker.emqx.io" para pruebas [24]
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
 DATA_TOPIC_WILDCARD = "dispositivo/+/telemetria" # Tópico Wildcard para datos [25, 26]
@@ -46,6 +43,9 @@ COMMAND_TOPIC_PREFIX = "dispositivo"
 # -------------------------
 
 # ----------------- Supabase client -----------------
+# $env:SUPABASE_URL="https://vnkbnqdjlgzwnzpsvxdd.supabase.co"
+# $env:SUPABASE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZua2JucWRqbGd6d256cHN2eGRkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTkyNTI3ODYsImV4cCI6MjA3NDgyODc4Nn0.m4e5JB3Yk3Bq5Q3TjnecolfY6pk-r_29JkDjCbxZkoY"
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -62,19 +62,15 @@ stop_event = threading.Event()
 
 SAMPLES_PER_INSERT = int(round(1.0 / SAMPLE_INTERVAL)) if SAMPLE_INTERVAL > 0 else 20
 buffers_by_sensor = defaultdict(lambda: deque(maxlen=SAMPLES_PER_INSERT))
-acc_window = deque()
-
+# acc_window = deque()
+acc_window_by_sensor = defaultdict(deque)
 # ----------------- SERIAL / MAPPING STATE -----------------
 port_to_serial = {}           # port_name -> serial.Serial object
-port_to_thread = {}           # port_name -> thread object
 device_to_port = {}           # device_id -> port_name
 device_to_sensor = {}         # device_id -> sensor_id (cache)
 sensor_to_device = {}         # sensor_id -> device_id (cache)
 sensor_started = set()        # sensor_id que estan START localmente
 mappings_lock = threading.Lock()
-
-pre_mapping_buffer = defaultdict(list)
-PREMAP_MAX = int(os.environ.get("PREMAP_MAX", "200"))
 
 # ----------------- Supabase retry params -----------------
 SB_MAX_RETRIES = int(os.environ.get("SB_MAX_RETRIES", "4"))
@@ -143,11 +139,6 @@ def _update_event(event_id, updates):
     res = _sb_call_with_retry(lambda: sb.table("evento").update(updates).eq("evento_id", event_id).execute())
     return res is not None
 
-# ----------------- UTILS (Sin cambios) -----------------
-def is_number(s):
-    try: float(s); return True
-    except: return False
-
 # ----------------- SIMULATE PRODUCER (Sin cambios) -----------------
 def producer_simulate_for_sensor(sensor_id, produce_interval=SAMPLE_INTERVAL,
                                  total_disp_target_um=SIMULATE_TARGET_UM, total_time_s=SIMULATE_DURATION_S):
@@ -175,95 +166,6 @@ def producer_simulate_for_sensor(sensor_id, produce_interval=SAMPLE_INTERVAL,
         except queue.Full: pass
         if total_time_s > 0 and t_rel > total_time_s: start_t = time.time()
         time.sleep(produce_interval)
-
-# ----------------- SERIAL (Sin cambios) -----------------
-def try_open_preferred_port(preferred_port=PREFERRED_PORT):
-    if serial is None or not preferred_port: return
-    if preferred_port in port_to_serial: return
-    try:
-        ser = serial.Serial(preferred_port, SERIAL_BAUD, timeout=1.0)
-        time.sleep(0.05); port_to_serial[preferred_port] = ser
-        t = threading.Thread(target=serial_reader_loop, args=(preferred_port, ser), daemon=True)
-        port_to_thread[preferred_port] = t; t.start() 
-    except Exception as e: print(f" No pude abrir puerto preferido {preferred_port}: {e}")
-
-def scan_and_open_ports():
-    if list_ports is None or serial is None: return
-    ports = list_ports.comports()
-    for p in ports:
-        name = p.device
-        if name not in port_to_serial:
-            try:
-                ser = serial.Serial(name, SERIAL_BAUD, timeout=1.0)
-                time.sleep(0.05); port_to_serial[name] = ser
-                t = threading.Thread(target=serial_reader_loop, args=(name, ser), daemon=True)
-                port_to_thread[name] = t; t.start()
-            except Exception as e: print(f" No pude abrir puerto {name}: {e}")
-
-def serial_reader_loop(port_name, ser):
-    """Lee líneas desde `ser` y encola lecturas con sensor_id asignado."""
-    while not stop_event.is_set():
-        try:
-            raw = ser.readline().decode('utf-8', errors='ignore').strip()
-            if not raw: continue
-            
-            # --- Lógica de parseo híbrida (Serial y MQTT usan JSON) ---
-            
-            # 1. Mensaje de ID (Solo Serial)
-            if raw.startswith("ID,"):
-                parts = raw.split(',')
-                if len(parts) >= 2:
-                    device = parts[1].strip()
-                    with mappings_lock:
-                        device_to_port[device] = port_name
-                        sensor_id = sb_find_sensor_by_device(device)
-                        if sensor_id is not None:
-                            device_to_sensor[device] = sensor_id
-                            sensor_to_device[sensor_id] = device
-                            print(f" Mapeado (Serial) device {device} -> sensor_id {sensor_id} (port {port_name})")
-                        else:
-                            print(f" Device {device} detectado en {port_name} pero SIN sensor configurado en DB")
-                continue
-            
-            # 2. Mensaje de Datos (JSON)
-            if raw.startswith("{") and raw.endswith("}"):
-                try:
-                    data = json.loads(raw)
-                    device = data.get("device_id")
-                    if not device: continue
-
-                    with mappings_lock:
-                        sensor_id = device_to_sensor.get(device)
-                    
-                    if sensor_id is None:
-                        sensor_id = sb_find_sensor_by_device(device)
-                        if sensor_id:
-                            with mappings_lock:
-                                device_to_sensor[device] = sensor_id
-                                sensor_to_device[sensor_id] = device
-                    
-                    if sensor_id:
-                        ts_us = float(data['ts_us'])
-                        ts = ts_us / 1e6 # Convertir microsegundos a segundos
-                        item = {
-                            "sensor_id": int(sensor_id), 
-                            "ts": ts, 
-                            "ax": float(data['ax']), 
-                            "ay": float(data['ay']), 
-                            "az": float(data['az'])
-                        }
-                        row_queue.put(item, timeout=0.3)
-                    
-                except json.JSONDecodeError:
-                    print(f" JSON malformado recibido: {raw}")
-                except queue.Full:
-                    pass # Ignorar
-                except Exception as e:
-                    print(f" Error procesando JSON: {e}")
-
-        except Exception: time.sleep(0.05)
-    try: ser.close()
-    except: pass
 
 # --- Lógica MQTT ---
 def on_mqtt_connect(client, userdata, flags, rc):
@@ -300,11 +202,11 @@ def on_mqtt_message(client, userdata, msg):
         
         if sensor_id:
             ts_us = float(payload['ts_us'])
-            ts = ts_us / 1e6 # Convertir microsegundos a segundos
-            ts = time.time()
+            # ts = ts_us / 1e6 # Convertir microsegundos a segundos
+            # ts = time.time()
             item = {
                 "sensor_id": int(sensor_id), 
-                "ts": ts, 
+                "ts": ts_us, 
                 "ax": float(payload['ax']), 
                 "ay": float(payload['ay']), 
                 "az": float(payload['az'])
@@ -335,7 +237,7 @@ def setup_mqtt_client():
 def control_thread_func(poll_interval=CONTROL_POLL_INTERVAL):
     """
     Poll: si enabled True -> Envía CMD,START; si disabled -> Envía CMD,STOP.
-    Funciona para TODOS los modos (Serial, MQTT, Simulate).
+    Funciona para TODOS los modos (MQTT, Simulate).
     """
     global mqtt_client
     print(" Hilo de control iniciado.")
@@ -359,14 +261,6 @@ def control_thread_func(poll_interval=CONTROL_POLL_INTERVAL):
 
                     # Lógica de envío de comando
                     if enabled and sid not in sensor_started:
-                        if MODE == "serial":
-                            port = device_to_port.get(dev)
-                            if port and port in port_to_serial:
-                                ser = port_to_serial[port]
-                                ser.write(b"CMD,START\n"); ser.flush()
-                                sensor_started.add(sid)
-                                print(f" Enviado (Serial) 'START' -> sensor {sid} (device {dev} on {port})")
-                        
                         if MODE == "mqtt" or MODE == "simulate":
                             if mqtt_client:
                                 topic = f"{COMMAND_TOPIC_PREFIX}/{dev}/comando"
@@ -380,22 +274,18 @@ def control_thread_func(poll_interval=CONTROL_POLL_INTERVAL):
                             sensor_started.discard(sid)
                             continue
 
-                        if MODE == "serial":
-                            port = device_to_port.get(dev_cached)
-                            if port and port in port_to_serial:
-                                ser = port_to_serial[port]
-                                ser.write(b"CMD,STOP\n"); ser.flush()
-                                sensor_started.discard(sid)
-                                print(f" Enviado (Serial) 'STOP' -> sensor {sid} (device {dev_cached} on {port})")
-                            else:
-                                sensor_started.discard(sid) # Descartar si el puerto ya no existe
-                        
                         if MODE == "mqtt" or MODE == "simulate":
                             if mqtt_client:
                                 topic = f"{COMMAND_TOPIC_PREFIX}/{dev_cached}/comando"
                                 mqtt_client.publish(topic, "STOP", qos=1) # [29, 35, 36, 38, 32, 34, 37]
                                 sensor_started.discard(sid)
                                 print(f" Enviado (MQTT) 'STOP' -> Tópico: {topic}")
+
+                                # BORRAR BUFFERS para este sensor al parar
+                                if sid in buffers_by_sensor:
+                                    buffers_by_sensor[sid].clear()
+                                if sid in acc_window_by_sensor:
+                                    acc_window_by_sensor[sid].clear()
 
         except Exception as e:
             print(f" Error en el bucle de control: {e}")
@@ -464,50 +354,90 @@ def alert_and_log_per_sensor(desp_um, ts_s, sensor_id):
             return "OK"
         return st
 
-def compute_desp_from_acc_window(ts, ax, ay, az):
+def compute_desp_from_acc_window(sensor_id, ts, ax, ay, az):
     """
-    Integra en ventana de tiempo para estimar desplazamiento pico-a-pico (µm).
+    Integra en ventana de tiempo para estimar desplazamiento pico-a-pico (µm)
+    CORREGIDO: 1. Usa dt en segundos. 2. Integra cada eje por separado.
     """
-    acc_window.append((ts, ax, ay, az))
-    while acc_window and (ts - acc_window[0][0] > ACC_WINDOW_SECONDS):
-        acc_window.popleft()
+    
+    # MANEJO DE LA VENTANA
+    # Convertir ts a segundos *aquí* es más limpio
+    ts_s = ts / 1_000_000.0 
+    window = acc_window_by_sensor[sensor_id]
+    window.append((ts_s, ax, ay, az))
+    
+    # ACC_WINDOW_SECONDS ahora debe ser en segundos (ej. 1.0)
+    while window and (ts_s - window[0][0] > ACC_WINDOW_SECONDS):
+        window.popleft()
 
-    if len(acc_window) < 3:
+    if len(window) < 10: # Necesitamos suficientes puntos para un promedio estable
         return 0.0
 
-    xs  = [r[0] for r in acc_window]
-    axs = [r[1] for r in acc_window]
-    ays = [r[2] for r in acc_window]
-    azs = [r[3] for r in acc_window]
+    # PREPARAR DATOS POR EJE (ts ya está en segundos)
+    xs_s = [r[0] for r in window]
+    axs  = [r[1] for r in window] 
+    ays  = [r[2] for r in window] 
+    azs  = [r[3] for r in window]
+    
+    # Quitar el bias (DC offset) de la aceleración para CADA EJE
+    mean_ax = sum(axs) / len(axs)
+    mean_ay = sum(ays) / len(ays)
+    mean_az = sum(azs) / len(azs)
+    
+    axs = [a - mean_ax for a in axs]
+    ays = [a - mean_ay for a in ays]
+    azs = [a - mean_az for a in azs]
 
-    # magnitud de aceleración
-    mags = [math.sqrt(axs[i]**2 + ays[i]**2 + azs[i]**2) for i in range(len(xs))]
+    # PRIMERA INTEGRACIÓN (Aceleración -> Velocidad)
+    vxs = [0.0] * len(xs_s)
+    vys = [0.0] * len(xs_s)
+    vzs = [0.0] * len(xs_s)
+    
+    for i in range(1, len(xs_s)):
+        # ¡¡LA CORRECCIÓN CLAVE!! dt está ahora en segundos
+        dt_s = xs_s[i] - xs_s[i-1] 
+        if dt_s <= 0: dt_s = 1e-9 # Evitar división por cero
 
-    # quitar bias (gravedad + drift DC)
-    mean_a = sum(mags)/len(mags)
-    mags = [m - mean_a for m in mags]
+        vxs[i] = vxs[i-1] + 0.5 * (axs[i] + axs[i-1]) * dt_s
+        vys[i] = vys[i-1] + 0.5 * (ays[i] + ays[i-1]) * dt_s
+        vzs[i] = vzs[i-1] + 0.5 * (azs[i] + azs[i-1]) * dt_s
 
-    # integrar aceleración -> velocidad
-    vs = [0.0]*len(mags)
-    for i in range(1, len(mags)):
-        dt = xs[i] - xs[i-1]
-        if dt <= 0: dt = 1e-6
-        vs[i] = vs[i-1] + 0.5*(mags[i] + mags[i-1])*dt
+    # Quitar el bias (drift) de la velocidad para CADA EJE
+    mean_vx = sum(vxs) / len(vxs)
+    mean_vy = sum(vys) / len(vys)
+    mean_vz = sum(vzs) / len(vzs)
+    
+    vxs = [v - mean_vx for v in vxs]
+    vys = [v - mean_vy for v in vys]
+    vzs = [v - mean_vz for v in vzs]
 
-    # quitar bias de velocidad
-    mean_v = sum(vs)/len(vs)
-    vs = [v - mean_v for v in vs]
+    # SEGUNDA INTEGRACIÓN (Velocidad -> Desplazamiento)
+    sxs = [0.0] * len(xs_s)
+    sys = [0.0] * len(xs_s)
+    szs = [0.0] * len(xs_s)
 
-    # integrar velocidad -> desplazamiento
-    ss = [0.0]*len(vs)
-    for i in range(1, len(vs)):
-        dt = xs[i] - xs[i-1]
-        if dt <= 0: dt = 1e-6
-        ss[i] = ss[i-1] + 0.5*(vs[i] + vs[i-1])*dt
+    for i in range(1, len(xs_s)):
+        # ¡¡LA CORRECCIÓN CLAVE!! dt está ahora en segundos
+        dt_s = xs_s[i] - xs_s[i-1]
+        if dt_s <= 0: dt_s = 1e-9
 
-    # pico-a-pico en µm
-    p2p_m = max(ss) - min(ss)
-    return abs(p2p_m * 1e6)
+        sxs[i] = sxs[i-1] + 0.5 * (vxs[i] + vxs[i-1]) * dt_s
+        sys[i] = sys[i-1] + 0.5 * (vys[i] + vys[i-1]) * dt_s
+        szs[i] = szs[i-1] + 0.5 * (vzs[i] + vzs[i-1]) * dt_s
+        
+    # El desplazamiento (sxs, sys, szs) ahora está en METROS (m)
+
+    # CALCULAR PICO-A-PICO (P2P)
+    # Opción A: P2P en cada eje
+    p2p_x_m = max(sxs) - min(sxs)
+    p2p_y_m = max(sys) - min(sys)
+    p2p_z_m = max(szs) - min(szs)
+
+    # Opción B: Magnitud del vector de desplazamiento P2P (más parecido a lo que intentabas)
+    p2p_mag_m = math.sqrt(p2p_x_m**2 + p2p_y_m**2 + p2p_z_m**2)
+
+    # Convertir de metros (m) a micrómetros (µm)
+    return abs(p2p_mag_m * 1_000_000.0)
 
 # ----------------- WRITER (Sin cambios) -----------------
 def writer_thread_func():
@@ -527,7 +457,8 @@ def writer_thread_func():
         az = float(item.get("az"))
 
         # cálculo por sensor
-        desp_um = compute_desp_from_acc_window(ts, ax, ay, az)
+        # desp_um = compute_desp_from_acc_window(ts, ax, ay, az)
+        desp_um = compute_desp_from_acc_window(sensor_id, ts, ax, ay, az)
 
         buffers_by_sensor[sensor_id].append({
             "ts": ts,
@@ -543,7 +474,9 @@ def writer_thread_func():
         if len(buffers_by_sensor[sensor_id]) >= SAMPLES_PER_INSERT:
             buf = buffers_by_sensor[sensor_id]
             n = len(buf)
-            avg_ts = sum(x["ts"] for x in buf) / n
+
+            ts_now_s = time.time()
+            # avg_ts = sum(x["ts"] for x in buf) / n
             avg_ax = sum(x["ax"] for x in buf) / n
             avg_ay = sum(x["ay"] for x in buf) / n
             avg_az = sum(x["az"] for x in buf) / n
@@ -557,10 +490,10 @@ def writer_thread_func():
                 desp_std = 0.0
 
             # Generar estado basado en el valor promedio de desplazamiento
-            estado = alert_and_log_per_sensor(avg_desp, avg_ts, sensor_id)
+            estado = alert_and_log_per_sensor(avg_desp, ts_now_s, sensor_id)
             estado = (estado or "OK").upper()
 
-            ts_iso = datetime.fromtimestamp(avg_ts, tz=timezone.utc).isoformat()
+            ts_iso = datetime.fromtimestamp(ts_now_s, tz=timezone.utc).isoformat()
 
             payload = {
                 "sensor_id": sensor_id,
@@ -577,19 +510,15 @@ def writer_thread_func():
             # insertar promedio en Supabase
             ok = safe_insert("lectura", payload)
             if ok:
-                print(f"[{datetime.fromtimestamp(avg_ts)}] INSERT promedio #{count//SAMPLES_PER_INSERT}: "
+                print(f"[{datetime.fromtimestamp(ts_now_s)}] INSERT promedio #{count//SAMPLES_PER_INSERT}: "
                       f"desp_avg={avg_desp:.2f} µm std={desp_std:.2f} µm estado={estado}")
             else:
-                print(f"[{datetime.fromtimestamp(avg_ts)}] ERROR INSERT promedio disp={avg_desp:.2f} µm estado={estado}")
+                print(f"[{datetime.fromtimestamp(ts_now_s)}] ERROR INSERT promedio disp={avg_desp:.2f} µm estado={estado}")
             
             # vaciar buffer para la próxima ventana (no solapado)
             buffers_by_sensor[sensor_id].clear()
 
 # ----------------- ORQUESTACIÓN / START (MODO HÍBRIDO) -----------------
-def start_serial_scanner_loop():
-    while not stop_event.is_set():
-        scan_and_open_ports()
-        time.sleep(SERIAL_SCAN_INTERVAL)
 
 def main():
     global mqtt_client
@@ -604,17 +533,6 @@ def main():
         if mqtt_client is None:
             print("Error fatal: No se pudo iniciar el cliente MQTT. Saliendo.")
             return
-        if sb:
-            control_thread = threading.Thread(target=control_thread_func, daemon=True)
-            control_thread.start()
-
-    elif MODE == "serial":
-        try_open_preferred_port(PREFERRED_PORT)
-        if list_ports is None or serial is None:
-            print("pyserial no instalado o no disponible. Instala pyserial si querés modo serial.")
-            return
-        scanner = threading.Thread(target=start_serial_scanner_loop, daemon=True)
-        scanner.start()
         if sb:
             control_thread = threading.Thread(target=control_thread_func, daemon=True)
             control_thread.start()
