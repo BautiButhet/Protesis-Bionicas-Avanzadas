@@ -61,6 +61,8 @@ row_queue = queue.Queue(maxsize=30000)   # items: dict {sensor_id, ts, ax, ay, a
 stop_event = threading.Event()
 
 SAMPLES_PER_INSERT = int(round(1.0 / SAMPLE_INTERVAL)) if SAMPLE_INTERVAL > 0 else 20
+# SAMPLES_PER_INSERT = 20
+
 buffers_by_sensor = defaultdict(lambda: deque(maxlen=SAMPLES_PER_INSERT))
 # acc_window = deque()
 acc_window_by_sensor = defaultdict(deque)

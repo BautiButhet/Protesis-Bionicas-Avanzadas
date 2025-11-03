@@ -17,12 +17,12 @@ const char* DEVICE_ID = "sensor_004"; // Debe coincidir con 'device_serial' en S
 // #define SAMPLE_INTERVAL_MS 50 // ~20Hz (Ajusta según SAMPLE_INTERVAL de Python)
 #define SAMPLE_INTERVAL_MS 5 // ~200Hz (Ajusta según SAMPLE_INTERVAL de Python)
 // --- CONFIG WIFI ---
-const char* WIFI_SSID = "Fibertel WiFi398 2.4GHz";     // <--- TU WIFI
-const char* WIFI_PASS = "0041782371"; // <--- TU CONTRASEÑA
+const char* WIFI_SSID = "UA-Alumnos"; //"Fibertel WiFi398 2.4GHz";     // <--- TU WIFI
+const char* WIFI_PASS = "41umn05WLC"; // <--- TU CONTRASEÑA
 
 // --- CONFIG MQTT ---
 // IP de tu PC ejecutando Docker/Mosquitto. O "broker.emqx.io" para pruebas [24, 28]
-const char* MQTT_BROKER = "192.168.0.24";  //ipconfig en consola
+const char* MQTT_BROKER = "172.22.43.165"; //"192.168.0.24";  //ipconfig en consola o publico "broker.emqx.io"
 const int MQTT_PORT = 1883;
 
 //     docker run -d --name mosquitto_broker -p 1883:1883 -p 9001:9001 `
